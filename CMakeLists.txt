@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(nevla VERSION 0.3.0 LANGUAGES CXX)
+project(nevla VERSION 0.4.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -23,7 +23,7 @@ else()
   set(NEVLA_MONGOCXX mongo::mongocxx_static)
 endif()
 
-add_library(nevla src/value.cc src/schema.cc src/model.cc)
+add_library(nevla src/value.cc src/schema.cc src/model.cc src/formula.cc)
 add_library(nevla::nevla ALIAS nevla)
 target_include_directories(nevla PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>

@@ -381,8 +381,14 @@ Value castFilter(const Schema &s, const Value &filter) {
     return out;
 }
 
+// A filter may be an object or a formula string ("age >= 18 && role == 'admin'")
+Value asFilter(const Value &filter) {
+    if (filter.isString()) return formulaFilter(filter.asString());
+    return filter.isObject() ? filter : Value::object();
+}
+
 Value prepareFilter(ModelImpl &m, const Value &filter) {
-    Value out = castFilter(m.schema, filter.isObject() ? filter : Value::object());
+    Value out = castFilter(m.schema, asFilter(filter));
     if (!m.discKey.empty()) out[m.discKey] = m.discValue;
     return out;
 }
@@ -1786,7 +1792,7 @@ int64_t Model::estimatedDocumentCount() const {
 
 bool Model::exists(const Value &filter) const {
     detail::QuerySpec s;
-    if (filter.isObject()) s.filter = filter;
+    s.filter = asFilter(filter);
     s.select = "_id";
     return !runFind(m_, s, true, "findOne").empty();
 }
@@ -1891,7 +1897,62 @@ std::string accName(const std::string &op, const std::string &field) {
 }
 
 Accumulator makeAcc(const char *op, const std::string &field) {
-    return Accumulator{std::string("$") + op, Value(fieldRef(field)), accName(op, field)};
+    if (field.rfind("$$", 0) == 0)  // $$ROOT, $$NOW ...
+        return Accumulator{std::string("$") + op, Value(field), op + std::string("Root")};
+    if (field.empty() || detail::isFieldPath(field))
+        return Accumulator{std::string("$") + op, Value(fieldRef(field)), accName(op, field)};
+    return Accumulator{std::string("$") + op, expr(field), ""};  // a formula: name it with .as()
+}
+
+// Accumulators -> $group fields
+void addAccumulators(Value &g, std::vector<Accumulator> &accumulators, bool reshaped, const Schema &schema,
+                     const char *where) {
+    for (auto &a : accumulators) {
+        if (a.name.empty())
+            throw Error(std::string("nevla: ") + where + ": an accumulator with a formula needs a name, e.g. " +
+                        a.op.substr(1) + "(\"price * qty\").as(\"revenue\")");
+        if (a.name == "_id") throw Error(std::string("nevla: ") + where + ": \"_id\" cannot be an accumulator name");
+        if (g.contains(a.name))
+            throw Error(std::string("nevla: ") + where + ": two accumulators are both named \"" + a.name +
+                        "\" (use .as(\"other\"))");
+        Value e = a.expr;
+        if (!reshaped && e.isString() && e.asString().size() > 1 && e.asString()[0] == '$' && e.asString()[1] != '$')
+            e = "$" + schema.resolveAlias(e.asString().substr(1));
+        g[a.name][a.op] = std::move(e);
+    }
+}
+
+std::vector<std::string> splitWords(const std::string &s) {
+    std::vector<std::string> out;
+    std::istringstream in(s);
+    std::string tok;
+    while (in >> tok) out.push_back(tok[0] == '$' ? tok.substr(1) : tok);
+    return out;
+}
+
+std::string lastSegment(const std::string &path) { return path.substr(path.rfind('.') + 1); }
+
+// "15m" -> {15, "minute"}
+std::pair<int64_t, std::string> parseInterval(const std::string &every) {
+    size_t i = 0;
+    while (i < every.size() && std::isdigit(static_cast<unsigned char>(every[i]))) i++;
+    int64_t n = i == 0 ? 1 : std::stoll(every.substr(0, i));
+    std::string u = every.substr(i);
+    while (!u.empty() && u[0] == ' ') u.erase(0, 1);
+    static const std::map<std::string, std::string> units = {
+        {"ms", "millisecond"}, {"s", "second"},      {"sec", "second"},      {"m", "minute"},
+        {"min", "minute"},     {"h", "hour"},        {"d", "day"},           {"w", "week"},
+        {"M", "month"},        {"q", "quarter"},     {"y", "year"},          {"millisecond", "millisecond"},
+        {"second", "second"},  {"minute", "minute"}, {"hour", "hour"},       {"day", "day"},
+        {"week", "week"},      {"month", "month"},   {"quarter", "quarter"}, {"year", "year"}};
+    std::string key = u;
+    if (key.size() > 2 && key.back() == 's' && units.count(key.substr(0, key.size() - 1)) && key != "ms")
+        key.pop_back();  // "minutes" -> "minute"
+    auto it = units.find(key);
+    if (it == units.end() || n <= 0)
+        throw Error("nevla: bucketByTime(): bad interval \"" + every +
+                    "\" (use e.g. \"30s\", \"15m\", \"1h\", \"1d\", \"1w\", \"1M\" for month, \"1y\")");
+    return {n, it->second};
 }
 }  // namespace
 
@@ -1910,8 +1971,10 @@ Accumulator accumulator(const std::string &op, Value expr, std::string name) {
 }
 
 /* ======================= Aggregate ======================= */
-Aggregate &Aggregate::match(const Value &filter) {
-    if (!filter.isObject()) throw Error("nevla: aggregate().match() needs an object");
+Aggregate &Aggregate::match(const Value &filterIn) {
+    if (!filterIn.isObject() && !filterIn.isString())
+        throw Error("nevla: aggregate().match() needs an object or a formula string");
+    Value filter = asFilter(filterIn);
     Value st = Value::object();
     st["$match"] = reshaped_ ? filter : castFilter(m_->schema, filter);
     stages_.push_back(std::move(st));
@@ -1936,15 +1999,7 @@ Aggregate &Aggregate::group(const std::string &by, std::vector<Accumulator> accu
         for (const auto &k : keys) id[k.substr(k.rfind('.') + 1)] = "$" + k;
         g["_id"] = std::move(id);
     }
-    for (auto &a : accumulators) {
-        if (a.name.empty() || a.name == "_id") throw Error("nevla: group(): every accumulator needs an output name");
-        if (g.contains(a.name))
-            throw Error("nevla: group(): two accumulators are both named \"" + a.name + "\" (use .as(\"other\"))");
-        Value expr = a.expr;
-        if (!reshaped_ && expr.isString() && expr.asString().size() > 1 && expr.asString()[0] == '$')
-            expr = "$" + m_->schema.resolveAlias(expr.asString().substr(1));
-        g[a.name][a.op] = std::move(expr);
-    }
+    addAccumulators(g, accumulators, reshaped_, m_->schema, "group()");
     Value st = Value::object();
     st["$group"] = std::move(g);
     stages_.push_back(std::move(st));
@@ -2082,6 +2137,299 @@ std::optional<Value> Aggregate::first() const {
 std::vector<Value> Model::aggregate(const Value &pipelineIn) const {
     if (!pipelineIn.isArray()) throw Error("nevla: aggregate() needs an array of stages (Value::array({...}))");
     return runAggregate(m_, castPipeline(*m_, pipelineIn), AggregateOptions{});
+}
+
+Aggregate &Aggregate::addField(const std::string &name, const std::string &formula) {
+    if (name.empty() || name[0] == '$') throw Error("nevla: aggregate().addField() needs a plain field name");
+    Value f = Value::object();
+    f[name] = expr(formula);
+    return addFields(f);
+}
+
+Aggregate &Aggregate::bucketByTime(const std::string &dateField, const std::string &every,
+                                   std::vector<Accumulator> accumulators, BucketOptions o) {
+    auto [binSize, unit] = parseInterval(every);
+    std::string field = dateField[0] == '$' ? dateField.substr(1) : dateField;
+    if (!reshaped_) field = m_->schema.resolveAlias(field);
+    Value trunc{{"date", "$" + field}, {"unit", unit}, {"binSize", binSize}};
+    if (!o.timezone.empty()) trunc["timezone"] = o.timezone;
+
+    Value id = Value::object();
+    id["time"] = Value{{"$dateTrunc", trunc}};
+    std::vector<std::string> keys;
+    for (auto &k : splitWords(o.by)) {
+        std::string real = reshaped_ ? k : m_->schema.resolveAlias(k);
+        std::string name = lastSegment(real);
+        if (name == "time" || id.contains(name))
+            throw Error("nevla: bucketByTime(): the 'by' field \"" + real + "\" clashes with another output name");
+        id[name] = "$" + real;
+        keys.push_back(name);
+    }
+    Value g = Value::object();
+    g["_id"] = std::move(id);
+    if (accumulators.empty()) accumulators.push_back(nevla::count());
+    addAccumulators(g, accumulators, reshaped_, m_->schema, "bucketByTime()");
+    stages_.push_back(Value{{"$group", g}});
+
+    // flatten: {_id: {time, device}, avgValue} -> {time, device, avgValue}  (time first, for charts)
+    Value flat = Value::object();
+    flat["time"] = "$_id.time";
+    for (const auto &k : keys) flat[k] = "$_id." + k;
+    stages_.push_back(
+        Value{{"$replaceRoot", Value{{"newRoot", Value{{"$mergeObjects", Value::array({flat, "$$ROOT"})}}}}}});
+    stages_.push_back(Value{{"$project", Value{{"_id", 0}}}});
+
+    if (o.fillGaps) {
+        Value range{{"step", binSize}, {"unit", unit}, {"bounds", keys.empty() ? "full" : "partition"}};
+        Value densify{{"field", "time"}, {"range", range}};
+        if (!keys.empty()) {
+            Value parts = Value::array();
+            for (const auto &k : keys) parts.push_back(k);
+            densify["partitionByFields"] = parts;
+        }
+        stages_.push_back(Value{{"$densify", densify}});
+        Value zeros = Value::object();  // empty buckets: counts and sums are 0
+        for (const auto &a : accumulators)
+            if (a.op == "$sum") zeros[a.name] = Value{{"$ifNull", Value::array({"$" + a.name, 0})}};
+        if (!zeros.empty()) stages_.push_back(Value{{"$addFields", zeros}});
+    }
+    Value sortSpec = Value::object();
+    sortSpec["time"] = 1;
+    for (const auto &k : keys) sortSpec[k] = 1;
+    stages_.push_back(Value{{"$sort", sortSpec}});
+    reshaped_ = true;
+    return *this;
+}
+
+namespace {
+// $lookup stages that do what Query.populate() does
+std::vector<Value> populateStages(const std::shared_ptr<ModelImpl> &m, const PopulateOptions &opt) {
+    const std::string path = m->schema.resolveAlias(opt.path);
+    for (size_t dot = path.find('.'); dot != std::string::npos; dot = path.find('.', dot + 1)) {
+        const Field *parent = m->schema.path(path.substr(0, dot));
+        if (parent && parent->type == FieldType::Array)
+            throw Error("nevla: aggregate().populate(\"" + path +
+                        "\"): paths inside arrays of sub-documents are not supported here; use find().populate()");
+    }
+    std::string refName, local, foreign;
+    bool justOne = false, idArray = false;
+    if (const VirtualPopulate *vp = findVirtualPopulate(m->schema, path)) {
+        refName = opt.model.empty() ? vp->ref : opt.model;
+        local = vp->localField;
+        foreign = vp->foreignField;
+        justOne = vp->justOne;
+    } else {
+        const Field *f = m->schema.path(path);
+        idArray = f && f->type == FieldType::Array;
+        if (idArray && f->of_) f = f->of_.get();
+        refName = !opt.model.empty() ? opt.model : f ? f->ref_ : "";
+        if (!f || refName.empty())
+            throw Error("nevla: aggregate().populate(\"" + path +
+                        "\"): the field has no .ref(\"Model\") and is not a virtualPopulate");
+        local = path;
+        foreign = "_id";
+        justOne = !idArray;
+    }
+    auto ref = lookup(refName);
+    bool keepOrder = idArray && opt.sort.isNull();
+
+    Value inner = Value::array();
+    if (!ref->discKey.empty()) inner.push_back(Value{{"$match", Value{{ref->discKey, ref->discValue}}}});
+    Value match = asFilter(opt.match);
+    if (!match.empty()) inner.push_back(Value{{"$match", castFilter(ref->schema, match)}});
+    if (!opt.sort.isNull()) inner.push_back(Value{{"$sort", detail::parseSort(opt.sort)}});
+    if (opt.limit > 0 && !keepOrder && !justOne) inner.push_back(Value{{"$limit", opt.limit}});
+    for (const auto &child : opt.populate)
+        for (auto &st : populateStages(ref, child)) inner.push_back(std::move(st));
+    std::string select;
+    for (auto &tok : splitWords(opt.select))
+        if (tok != "-_id" || !keepOrder) select += tok + " ";  // the order fix needs _id
+    Value proj = buildProjection(ref->schema, select);
+    if (!proj.empty()) inner.push_back(Value{{"$project", proj}});
+
+    const std::string tmp = "__nv_pop";
+    Value lk{
+        {"from", ref->collection}, {"localField", local}, {"foreignField", foreign}, {"as", keepOrder ? tmp : path}};
+    if (!inner.empty()) lk["pipeline"] = inner;
+    std::vector<Value> out;
+    out.push_back(Value{{"$lookup", lk}});
+
+    if (keepOrder) {  // same order as the ids in the array, missing ones dropped (like Query.populate)
+        Value pick{
+            {"$let",
+             Value{{"vars", Value{{"i", Value{{"$indexOfArray", Value::array({"$" + tmp + "._id", "$$id"})}}}}},
+                   {"in", Value{{"$cond", Value::array({Value{{"$gte", Value::array({"$$i", 0})}},
+                                                        Value{{"$arrayElemAt", Value::array({"$" + tmp, "$$i"})}},
+                                                        Value()})}}}}}};
+        Value mapped{{"$map", Value{{"input", Value{{"$ifNull", Value::array({"$" + path, Value::array()})}}},
+                                    {"as", "id"},
+                                    {"in", pick}}}};
+        Value kept{{"$filter",
+                    Value{{"input", mapped}, {"as", "d"}, {"cond", Value{{"$ne", Value::array({"$$d", Value()})}}}}}};
+        if (opt.limit > 0) kept = Value{{"$slice", Value::array({kept, opt.limit})}};
+        Value set = Value::object();
+        set[path] = kept;
+        out.push_back(Value{{"$addFields", set}});
+        out.push_back(Value{{"$project", Value{{tmp, 0}}}});
+    } else if (justOne) {  // single document or null
+        Value set = Value::object();
+        set[path] = Value{{"$ifNull", Value::array({Value{{"$arrayElemAt", Value::array({"$" + path, 0})}}, Value()})}};
+        out.push_back(Value{{"$addFields", set}});
+    }
+    return out;
+}
+
+std::string shellValue(const Value &v) {
+    switch (v.type()) {
+        case Value::Type::ObjectId:
+            return "ObjectId(\"" + v.str() + "\")";
+        case Value::Type::Date:
+            return "ISODate(\"" + v.asDate().iso() + "\")";
+        case Value::Type::Array: {
+            std::string out = "[";
+            bool first = true;
+            for (const auto &e : v.elements()) {
+                out += (first ? "" : ", ") + shellValue(e);
+                first = false;
+            }
+            return out + "]";
+        }
+        case Value::Type::Object: {
+            std::string out = "{";
+            bool first = true;
+            for (const auto &kv : v.items()) {
+                out += (first ? "" : ", ") + Value(kv.first).toJson() + ": " + shellValue(kv.second);
+                first = false;
+            }
+            return out + "}";
+        }
+        default:
+            return v.toJson();
+    }
+}
+
+std::string describePlan(const Value &n) {
+    if (n.contains("queryPlan")) return describePlan(n["queryPlan"]);
+    std::string s = n["stage"].str();
+    if (n.contains("indexName")) s += "(" + n["indexName"].str() + ")";
+    if (n.contains("inputStage")) s += " > " + describePlan(n["inputStage"]);
+    if (n.contains("inputStages")) {
+        s += " > [";
+        bool first = true;
+        for (const auto &c : n["inputStages"].elements()) {
+            s += (first ? "" : ", ") + describePlan(c);
+            first = false;
+        }
+        s += "]";
+    }
+    return s;
+}
+
+const Value *findKey(const Value &v, const std::string &key) {
+    if (v.isObject()) {
+        if (const Value *hit = v.find(key)) return hit;
+        for (const auto &kv : v.items())
+            if (const Value *hit = findKey(kv.second, key)) return hit;
+    } else if (v.isArray()) {
+        for (const auto &e : v.elements())
+            if (const Value *hit = findKey(e, key)) return hit;
+    }
+    return nullptr;
+}
+
+std::string keyText(const Value &k) {
+    if (k.isNull()) return "null";
+    if (k.isObject() || k.isArray()) return k.toJson();
+    return k.str();
+}
+}  // namespace
+
+Aggregate &Aggregate::populate(const std::string &path) {
+    PopulateOptions o;
+    o.path = path;
+    return populate(o);
+}
+
+Aggregate &Aggregate::populate(const PopulateOptions &options) {
+    if (reshaped_)
+        throw Error("nevla: aggregate().populate(\"" + options.path +
+                    "\") must come before group() / project() / addFields() (the schema is needed)");
+    for (auto &st : populateStages(m_, options)) stages_.push_back(std::move(st));
+    return *this;
+}
+
+std::string Aggregate::toShell() const {
+    return "db.getCollection(" + Value(m_->collection).toJson() + ").aggregate(" + shellValue(pipeline()) + ")";
+}
+
+Value Aggregate::explain() const {
+    auto c = currentConn();
+    Value cmd = Value::object();
+    cmd["explain"] = Value{{"aggregate", m_->collection}, {"pipeline", pipeline()}, {"cursor", Value::object()}};
+    cmd["verbosity"] = "queryPlanner";
+    return guard([&]() -> Value {
+        auto entry = c->pool->acquire();
+        return fromBson((*entry)[c->db].run_command(toBson(cmd)).view());
+    });
+}
+
+std::string Aggregate::plan() const {
+    Value e = explain();
+    const Value *wp = findKey(e, "winningPlan");
+    return wp ? describePlan(*wp) : "unknown";
+}
+
+/* ---------------- one-line reports ---------------- */
+Value Model::countBy(const std::string &field, const Value &filter) const {
+    Aggregate a(m_);
+    if (!asFilter(filter).empty()) a.match(filter);
+    Value out = Value::object();
+    for (auto &r : a.group(field, {count()}).sort("-count _id").exec()) out[keyText(r["_id"])] = r["count"];
+    return out;
+}
+
+Value Model::sumBy(const std::string &groupField, const std::string &sumField, const Value &filter) const {
+    Aggregate a(m_);
+    if (!asFilter(filter).empty()) a.match(filter);
+    Value out = Value::object();
+    for (auto &r : a.group(groupField, {sum(sumField).as("v")}).sort("-v _id").exec()) out[keyText(r["_id"])] = r["v"];
+    return out;
+}
+
+Value Model::avgBy(const std::string &groupField, const std::string &avgField, const Value &filter) const {
+    Aggregate a(m_);
+    if (!asFilter(filter).empty()) a.match(filter);
+    Value out = Value::object();
+    for (auto &r : a.group(groupField, {avg(avgField).as("v")}).sort("-v _id").exec()) out[keyText(r["_id"])] = r["v"];
+    return out;
+}
+
+Value Model::stats(const std::string &field, const Value &filter) const {
+    Aggregate a(m_);
+    if (!asFilter(filter).empty()) a.match(filter);
+    std::string f = m_->schema.resolveAlias(field);
+    Value numeric = Value::object();
+    numeric[f] = Value{{"$type", "number"}};  // only numbers count
+    a.stage(Value{{"$match", numeric}});
+    auto row = a.group("", {count(), sum(f).as("sum"), avg(f).as("avg"), min(f).as("min"), max(f).as("max"),
+                            stdDevPop(f).as("stdDev")})
+                   .first();
+    if (!row)
+        return Value{{"count", 0},     {"sum", 0},       {"avg", Value()},
+                     {"min", Value()}, {"max", Value()}, {"stdDev", Value()}};
+    row->erase("_id");
+    return *row;
+}
+
+std::vector<Value> Model::latestPerGroup(const std::string &groupField, const std::string &sortField,
+                                         const Value &filter) const {
+    Aggregate a(m_);
+    if (!asFilter(filter).empty()) a.match(filter);
+    return a.sort("-" + sortField)
+        .group(groupField, {first("$$ROOT").as("doc")})
+        .replaceRoot("doc")
+        .sort("-" + sortField)
+        .exec();
 }
 
 Aggregate Model::aggregate() const { return Aggregate(m_); }

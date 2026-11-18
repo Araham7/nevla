@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include "formula.hpp"
 #include "schema.hpp"
 
 namespace nevla {
@@ -259,6 +260,7 @@ class QueryBase {
 
   protected:
     QueryBase(std::shared_ptr<ModelImpl> m, Value filter) : m_(std::move(m)) {
+        if (filter.isString()) filter = formulaFilter(filter.asString());  // find("age >= 18 && role == 'admin'")
         if (filter.isObject()) spec_.filter = std::move(filter);
     }
     D &self() { return static_cast<D &>(*this); }
@@ -357,7 +359,8 @@ struct Accumulator {
         return *this;
     }
 };
-Accumulator sum(const std::string &field);  // field: "value", "reading.temp" or an expression string "$value"
+// field: "value" / "reading.temp", or a formula: sum("price * qty").as("revenue") (a formula needs .as())
+Accumulator sum(const std::string &field);
 Accumulator avg(const std::string &field);
 Accumulator min(const std::string &field);
 Accumulator max(const std::string &field);
@@ -368,6 +371,13 @@ Accumulator addToSet(const std::string &field);  // array of distinct values
 Accumulator count();                             // number of documents -> "count"
 Accumulator stdDevPop(const std::string &field);
 Accumulator accumulator(const std::string &op, Value expr, std::string name);  // anything else: ("$top", {...}, "x")
+
+// bucketByTime() options
+struct BucketOptions {
+    std::string by;         // also split by these fields: "device" or "device room"
+    std::string timezone;   // "Asia/Kolkata": day / week / month buckets start at local midnight
+    bool fillGaps = false;  // add empty buckets (count / sum = 0) so charts have no holes (needs MongoDB 5.1+)
+};
 
 struct AggregateOptions {
     bool allowDiskUse = false;  // big $group / $sort may use disk
@@ -380,7 +390,7 @@ class Aggregate {
   public:
     // $match. Cast with the schema while the documents still have the schema's shape
     // (i.e. before group / project / addFields / replaceRoot / raw stage). Throws CastError on bad values.
-    Aggregate &match(const Value &filter);
+    Aggregate &match(const Value &filter);  // also a formula: match("temp > 30 && room == 'lab'")
     // $group by "" (everything), "device", or several fields "device type" -> _id {device, type}
     Aggregate &group(const std::string &by, std::vector<Accumulator> accumulators = {});
     Aggregate &sort(const Value &spec);  // "-avgValue name" or {{"avgValue", -1}}
@@ -395,8 +405,18 @@ class Aggregate {
                       const std::string &as);
     Aggregate &count(const std::string &as = "count");  // $count: one document {as: n}
     Aggregate &sample(int64_t n);
-    Aggregate &replaceRoot(const std::string &path);  // "$doc" or "doc"
-    Aggregate &stage(const Value &rawStage);          // anything else: {{"$facet", {...}}}
+    Aggregate &replaceRoot(const std::string &path);                           // "$doc" or "doc"
+    Aggregate &addField(const std::string &name, const std::string &formula);  // addField("total", "price * qty")
+    /* Time buckets for charts: one row per 15 minutes / hour / day ...
+       every: "30s" "15m" "1h" "6h" "1d" "1w" "1M" (month) "1q" "1y"
+       rows: {time, [by fields], accumulators...} sorted by time                                 */
+    Aggregate &bucketByTime(const std::string &dateField, const std::string &every,
+                            std::vector<Accumulator> accumulators = {}, BucketOptions o = {});
+    // Like Query.populate() but inside the pipeline ($lookup from the schema's ref / virtualPopulate).
+    // Must come before group() / project(). Array refs keep their order.
+    Aggregate &populate(const std::string &path);
+    Aggregate &populate(const PopulateOptions &options);
+    Aggregate &stage(const Value &rawStage);  // anything else: {{"$facet", {...}}}
     Aggregate &options(AggregateOptions o);
 
     std::vector<Value> exec() const;
@@ -409,6 +429,9 @@ class Aggregate {
     std::optional<Value> first() const;  // only the first result (adds $limit 1)
     Value pipeline() const;              // the stages as they will be sent (incl. discriminator $match)
     std::string toJson(int indent = 2) const { return pipeline().toJson(indent); }
+    std::string toShell() const;  // db.readings.aggregate([...]) with ObjectId(...) / ISODate(...): paste into mongosh
+    Value explain() const;        // MongoDB's query plan (queryPlanner)
+    std::string plan() const;     // short summary: "IXSCAN(device_1_at_-1)" or "COLLSCAN" (= no index used!)
 
   private:
     friend class Model;
@@ -460,6 +483,21 @@ class Model {
     BulkWriteResult bulkWrite(const std::vector<Value> &operations, bool ordered = true) const;
 
     int64_t countDocuments(const Value &filter = Value::object()) const;
+
+    /* One-line reports (filters may be objects or formulas):
+         Order.countBy("status")                 -> {"paid": 120, "pending": 8}      (biggest first)
+         Order.sumBy("customer", "amount")       -> {"asha": 5400, "ravi": 1200}
+         Reading.avgBy("device", "value")        -> {"<id>": 24.5, ...}
+         Reading.stats("value", "at >= date('2026-11-01')") -> {count, sum, avg, min, max, stdDev}
+         Reading.latestPerGroup("device", "at")  -> the newest document of every device             */
+    Value countBy(const std::string &field, const Value &filter = Value::object()) const;
+    Value sumBy(const std::string &groupField, const std::string &sumField,
+                const Value &filter = Value::object()) const;
+    Value avgBy(const std::string &groupField, const std::string &avgField,
+                const Value &filter = Value::object()) const;
+    Value stats(const std::string &field, const Value &filter = Value::object()) const;
+    std::vector<Value> latestPerGroup(const std::string &groupField, const std::string &sortField = "_id",
+                                      const Value &filter = Value::object()) const;
     int64_t estimatedDocumentCount() const;
     bool exists(const Value &filter) const;
     std::vector<Value> distinct(const std::string &field, const Value &filter = Value::object()) const;

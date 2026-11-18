@@ -54,7 +54,7 @@ Hindi/Hinglish guide: [docs/README.hinglish.md](docs/README.hinglish.md)
 12. [Updating](#updating)
 13. [Deleting](#deleting)
 14. [Bulk writes](#bulk-writes)
-15. [Aggregation builder](#aggregation-builder) · [Distinct and counting](#distinct-and-counting)
+15. [Aggregation builder](#aggregation-builder) · [Time buckets](#time-buckets-for-charts-bucketbytime) · [Populate in pipelines](#populate-inside-a-pipeline) · [One-line reports](#one-line-reports) · [Formula strings](#formula-strings) · [Distinct and counting](#distinct-and-counting)
 16. [Sub-documents, arrays and maps](#sub-documents-arrays-and-maps)
 17. [Populate](#populate)
 18. [Middleware (hooks)](#middleware-hooks)
@@ -91,6 +91,8 @@ nevla gives C++ the developer experience of Mongoose:
 | Chainable queries | `User.find().where("age").gte(18).sort("-age").limit(10).exec()` |
 | Relations | `populate("author")`, nested populate, virtual populate |
 | Easy aggregation | `aggregate().match(...).group("device", {avg("value")}).exec()` with automatic casting |
+| Formulas | `find("age >= 18 && role == 'admin'")`, `addField("total", "price * qty")` |
+| Dashboards | `bucketByTime("at", "15m", ...)`, `countBy("status")`, `stats("value")`, `latestPerGroup(...)` |
 | Middleware | `pre/post` hooks for `save`, `validate`, `find`, `updateOne`, `aggregate`, ... |
 | Real-world features | transactions, change streams, bulk writes, cursors, pagination, optimistic concurrency |
 | C++ comfort | `NEVLA_STRUCT` maps your structs to documents at compile time |
@@ -172,7 +174,7 @@ target_link_libraries(myapp PRIVATE nevla::nevla)
 
 ```cmake
 include(FetchContent)
-FetchContent_Declare(nevla GIT_REPOSITORY https://github.com/<your-username>/nevla.git GIT_TAG v0.3.0)
+FetchContent_Declare(nevla GIT_REPOSITORY https://github.com/<your-username>/nevla.git GIT_TAG v0.4.0)
 FetchContent_MakeAvailable(nevla)
 target_link_libraries(myapp PRIVATE nevla::nevla)
 ```
@@ -180,7 +182,7 @@ target_link_libraries(myapp PRIVATE nevla::nevla)
 **C. After `cmake --install`**
 
 ```cmake
-find_package(nevla 0.3 CONFIG REQUIRED)
+find_package(nevla 0.4 CONFIG REQUIRED)
 target_link_libraries(myapp PRIVATE nevla::nevla)
 ```
 
@@ -455,6 +457,15 @@ User.where("age").gte(18).count();                  // model-level where()
 Filters are cast with the schema: `{{"age", "18"}}` becomes `18`, `{{"_id", "665f..."}}` becomes an `ObjectId`,
 `$in` arrays, `$elemMatch` on sub-document arrays and aliases are handled too.
 
+Any filter can also be a **formula string** (see [Formula strings](#formula-strings)):
+
+```cpp
+User.find("age >= 18 && role in ['admin', 'editor']").sort("-age").exec();
+User.countDocuments("plan == 'pro' || credits > 0");
+User.updateMany("lastSeen < date('2026-01-01')", {{"active", false}});
+User.deleteMany("used > limit");                    // field compared with field -> $expr
+```
+
 ---
 
 ## Cursors and pagination
@@ -611,12 +622,14 @@ Choose your own with `.as()`: `avg("value").as("meanTemp")`. Two accumulators wi
 
 | Builder | Stage |
 |---|---|
-| `match(filter)` | `$match` (cast, see above) |
+| `match(filter)` / `match("temp > 30 && room == 'lab'")` | `$match` (cast, see above; formulas allowed) |
 | `group(by, {accumulators})` | `$group` |
 | `sort("-a b")` / `sort({{"a", -1}})` | `$sort` |
 | `limit(n)`, `skip(n)`, `sample(n)` | `$limit`, `$skip`, `$sample` |
 | `project("a b -_id")` / `project({{"total", expr}})` | `$project` |
-| `addFields({{"total", expr}})` | `$addFields` |
+| `addFields({{"total", expr}})` / `addField("total", "price * qty")` | `$addFields` |
+| `bucketByTime("at", "15m", {avg("value")}, {...})` | time buckets for charts (see below) |
+| `populate("author")` / `populate(PopulateOptions)` | `$lookup` from the schema's `ref` (see below) |
 | `unwind("tags")` / `unwind("tags", true)` | `$unwind` (`true` keeps documents with empty arrays) |
 | `lookup("Author", "author", "_id", "authorDoc")` | `$lookup` (a model name or a collection name) |
 | `count("n")` | `$count` |
@@ -630,9 +643,16 @@ Running it:
 std::vector<Value> rows = agg.exec();
 std::optional<Value> one = agg.first();              // adds $limit 1
 std::vector<DeviceStat> typed = agg.exec<DeviceStat>();   // NEVLA_STRUCT; the group key "_id" -> member "id"
-std::cout << agg.toJson();                           // the pipeline that will be sent (paste into mongosh)
+std::cout << agg.toJson();                           // the pipeline as JSON
+std::cout << agg.toShell();                          // db.getCollection("readings").aggregate([... ObjectId(..), ISODate(..)])
+std::cout << agg.plan();                             // "IXSCAN(device_1_at_-1)" or "COLLSCAN" (no index!)
+Value plan = agg.explain();                          // MongoDB's full query plan
 Value stages = agg.pipeline();
 ```
+
+`toShell()` prints the pipeline exactly as you would type it in `mongosh` (with `ObjectId("...")` and
+`ISODate("...")`), so you can paste it into mongosh / Compass to try it by hand. `plan()` tells you in one line
+whether MongoDB uses an index: `COLLSCAN` means it reads the whole collection — add an index.
 
 A full example: device report with a join.
 
@@ -661,6 +681,136 @@ Good to know:
 - A read that the server interrupts because a collection was created or dropped during the query
   (`QueryPlanKilled`) is retried automatically (not for `$out` / `$merge`, not inside transactions).
 - On Windows, define `NOMINMAX` before including `<windows.h>` so `min()` / `max()` are not macros.
+
+### Time buckets for charts: `bucketByTime`
+
+One row per time slot — exactly what a dashboard chart needs:
+
+```cpp
+auto rows = Reading.aggregate()
+    .match({{"device", id}, {"at", {{"$gte", "2026-11-18"}}}})
+    .bucketByTime("at", "15m", {avg("value"), min("value"), max("value"), count()})
+    .exec();
+// [{time: 2026-11-18T10:00Z, avgValue: 24.1, minValue: 22, maxValue: 26, count: 12},
+//  {time: 2026-11-18T10:15Z, ...}, ...]          sorted by time, "time" is the first field
+```
+
+| Option | Meaning |
+|---|---|
+| interval | `"30s"`, `"15m"`, `"1h"`, `"6h"`, `"1d"`, `"1w"`, `"1M"` (month), `"1q"`, `"1y"`; also `"2 hours"` |
+| accumulators | as in `group()`; none = `count()` |
+| `.by = "device"` | one series per device: rows get a `device` field too (`"device room"` for several) |
+| `.timezone = "Asia/Kolkata"` | days / weeks / months start at local midnight instead of UTC |
+| `.fillGaps = true` | add the empty slots too (`count`/`sum` = 0, others null) so the chart has no holes (MongoDB 5.1+) |
+
+```cpp
+// hourly average per device for the last day, in Indian time, with empty hours filled in
+Reading.aggregate()
+    .match("at >= date('2026-11-17T00:00:00+05:30')")
+    .bucketByTime("at", "1h", {avg("value")}, {.by = "device", .timezone = "Asia/Kolkata", .fillGaps = true})
+    .exec();
+```
+
+Uses MongoDB's `$dateTrunc` (MongoDB 5.0+).
+
+### Populate inside a pipeline
+
+`populate()` in the builder uses the schema's `ref` (or a `virtualPopulate`) and writes the `$lookup` for you —
+no collection names, no `localField` / `foreignField` to remember:
+
+```cpp
+// readings per room, the room comes from the referenced device
+Reading.aggregate().populate("device").group("device.room", {avg("value"), count()}).exec();
+
+PopulateOptions author;
+author.path = "author";
+author.select = "name company";               // select(false) fields stay hidden
+author.match = "active == true";              // object or formula; no match -> null
+PopulateOptions company;
+company.path = "company";
+author.populate.push_back(company);           // nested
+Post.aggregate().match("published").populate(author).populate("tags").exec();
+
+Author.aggregate().populate("posts").addField("postCount", "size(posts)").sort("-postCount").exec();  // virtual
+```
+
+- single refs become the document or `null`; arrays of ids keep their order and drop ids that no longer exist
+  (same as `Query.populate()`); `sort` / `limit` work per document;
+- it must come **before** `group()` / `project()` / `addFields()` (the schema is needed);
+- paths inside arrays of sub-documents (`comments.by`) are not supported here — use `find().populate()`;
+- needs MongoDB 5.0+ (`$lookup` with `localField` + `pipeline`).
+
+### One-line reports
+
+The most common dashboard questions, each in one call (filters may be objects or formulas):
+
+```cpp
+Order.countBy("status");                          // {"paid": 120, "pending": 8}        biggest first
+Order.countBy("status", "createdAt >= date('2026-11-01')");
+Order.sumBy("customer", "amount");                // {"asha": 5400, "ravi": 1200}
+Reading.avgBy("device", "value", "value > 0");    // {"<deviceId>": 24.5, ...}
+Reading.stats("value");                           // {count, sum, avg, min, max, stdDev}  (numbers only)
+Reading.latestPerGroup("device", "at");           // the newest reading of every device (whole documents)
+```
+
+Keys are text (`ObjectId` → hex, `null` → `"null"`). `stats()` on no data returns `count: 0` and nulls.
+
+---
+
+## Formula strings
+
+Write expressions and conditions like normal maths / C++ instead of nested MongoDB objects.
+`nevla::expr()` makes an aggregation expression, `nevla::formulaFilter()` makes a query filter — and every place
+that takes a filter or an expression accepts a formula string directly:
+
+```cpp
+Post.find("published && views >= 100 && tag in ['cpp', 'iot']").exec();
+Order.aggregate()
+    .match("status == 'paid' && createdAt >= date('2026-11-01')")
+    .addField("total", "price * qty * (1 - discount)")
+    .group("customer", {sum("total"), sum("price * qty").as("gross"), count()})
+    .exec();
+User.aggregate().addField("label", "if(age >= 18, 'adult', 'minor')").group("label", {count()}).exec();
+```
+
+| | Write |
+|---|---|
+| values | `12` `3.5` `1e3` `'text'` `"text"` `true` `false` `null` `[1, 2]` `date('2026-11-17')` `now()` |
+| fields | `price` `address.city` `items.0.qty` (or `$price`) |
+| maths | `+ - * / %` and unary `-` |
+| compare | `== != < <= > >=` (a single `=` also means equality), `x in [..]`, `x not in [..]` |
+| logic | `&& \|\| !` or `and or not` |
+| functions | `abs ceil floor round(x, places) trunc sqrt pow exp ln log10 log(x, base)` |
+| | `min max sum avg` (several values, or one array field), `size(array)` |
+| | `concat lower upper trim len substr(s, start, count)` |
+| | `if(cond, a, b)` `ifNull(a, b)` `exists(field)` |
+| | `year month day hour minute second dayOfWeek` (date[, 'Asia/Kolkata']), `dateDiff(a, b, 'day')` |
+| | `toInt toDouble toString toDate toBool` |
+
+**Filters stay fast.** A part like `field <op> constant` becomes a normal filter condition, so it uses indexes
+and gets the schema's casting (`"at >= '2026-11-17'"` compares with a real `Date`). Only parts that compare
+fields with each other or use maths/functions become `{$expr: ...}`:
+
+```cpp
+formulaFilter("temp > 30 && room == 'lab'")   // {temp: {$gt: 30}, room: "lab"}
+formulaFilter("age >= 18 && age < 60")        // {age: {$gte: 18, $lt: 60}}
+formulaFilter("used > limit")                 // {$expr: {$gt: ["$used", "$limit"]}}
+formulaFilter("active && !deleted")           // {active: true, deleted: {$ne: true}}
+```
+
+**Clear errors.** A mistake throws `nevla::FormulaError` (a `nevla::Error`) with the column:
+
+```
+formula error at column 9: unexpected '*'
+  price * * qty
+          ^
+```
+
+Unknown functions list the available ones; `date('2026-02-30')` is rejected; `a < b < c` asks for
+`a < b && b < c`. Use `+` for numbers and `concat()` for text. A text literal starting with `$` is text,
+not a field (`'$5 off'`).
+
+An accumulator with a formula needs a name: `sum("price * qty").as("revenue")`.
 
 ---
 
@@ -964,6 +1114,7 @@ All errors derive from `nevla::Error` (a `std::runtime_error`).
 | `DuplicateKeyError` | unique index or duplicate `_id` (MongoDB E11000) |
 | `NotFoundError` | `orFail()` found nothing; `save()` on a document that no longer exists |
 | `VersionError` | `optimisticConcurrency` conflict on `save()` |
+| `FormulaError` | a formula string has a mistake; `.column` (1-based) |
 | `Error` | everything else: not connected, bad JSON, server errors |
 
 ```cpp
@@ -1053,6 +1204,8 @@ C++ designated initializers must keep this order; write only the ones you need:
 | `schema.plugin(fn, opts)` | `schema.plugin(fn, opts)` |
 | `Model.discriminator('Sensor', schema)` | `Model.discriminator("Sensor", schema)` |
 | `Model.aggregate().match({...}).group({...})` | `Model.aggregate().match({...}).group("field", {avg("x")})` |
+| `{ $expr: { $gt: ['$used', '$limit'] } }` | `"used > limit"` (formula string) |
+| `$group` by `$dateTrunc` + `$densify` | `bucketByTime("at", "15m", {...}, {.fillGaps = true})` |
 | `Model.bulkWrite([...])` | `Model.bulkWrite({...})` |
 | `Model.watch()` | `Model.watch()` |
 | `Query.cursor()` | `Query.cursor()` |
@@ -1087,24 +1240,25 @@ nevla/
 │   ├── nevla.hpp        # include this
 │   ├── value.hpp        # Value, Date, ObjectId
 │   ├── schema.hpp       # Schema, Field, errors
-│   ├── model.hpp        # connect, Model, Document, Query, Cursor, ChangeStream
+│   ├── model.hpp        # connect, Model, Document, Query, Cursor, ChangeStream, Aggregate
+│   ├── formula.hpp      # expr(), formulaFilter(), FormulaError
 │   └── typed.hpp        # NEVLA_STRUCT
-├── src/                 # value.cc, schema.cc, model.cc
+├── src/                 # value.cc, schema.cc, model.cc, formula.cc
 ├── examples/
 │   ├── 01_quickstart.cc     # CRUD
 │   ├── 02_blog.cc           # populate, hooks, virtuals, methods
 │   ├── 03_iot.cc            # custom _id, discriminators, TTL, aggregate, transaction
 │   ├── 04_typed_struct.cc   # NEVLA_STRUCT
 │   ├── 05_features.cc       # statics, plugins, Map, getters, virtual populate, paginate, cursor, bulkWrite
-│   └── 06_iot_dashboard.cc  # end-to-end: 8 writer threads + live dashboards, every number verified
-├── tests/test.cc        # 377 checks against a real MongoDB
+│   └── 06_iot_dashboard.cc  # end-to-end: 8 writers + 5 live dashboards, every number verified
+├── tests/test.cc        # 471 checks against a real MongoDB
 ├── docs/README.hinglish.md
 ├── .github/workflows/ci.yml
 ├── CHANGELOG.md  CONTRIBUTING.md  LICENSE  CMakeLists.txt
 ```
 
 ```bash
-./build/nevla_tests                                         # "377 passed, 0 failed"
+./build/nevla_tests                                         # "471 passed, 0 failed"
 NEVLA_TEST_URI="mongodb://host:27017/?replicaSet=rs0" ./build/nevla_tests
 cd build && ctest
 ./build/05_features

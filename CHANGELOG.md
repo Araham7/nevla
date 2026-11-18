@@ -3,6 +3,28 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] - 2026-11-18
+
+### Added
+- **Formula strings** (`include/nevla/formula.hpp`): `expr("price * qty * (1 - discount)")` and
+  `formulaFilter("temp > 30 && room == 'lab'")` with maths, comparisons, `in` / `not in`, `&& || !`,
+  `date('...')`, `now()` and 40 functions (`round`, `if`, `concat`, `year`, `dateDiff`, ...).
+  Simple `field <op> constant` parts become normal, index-friendly, schema-cast filter conditions; the rest
+  becomes `$expr`. Mistakes throw `FormulaError` with the column and a caret.
+- Formulas everywhere a filter is accepted: `find("...")`, `findOne`, `countDocuments`, `exists`,
+  `updateOne/Many`, `deleteOne/Many`, `bulkWrite` filters, `aggregate().match("...")`, `PopulateOptions::match`.
+- `Aggregate::addField(name, formula)`; accumulators take formulas: `sum("price * qty").as("revenue")`.
+- `Aggregate::bucketByTime(field, "15m", accumulators, {.by, .timezone, .fillGaps})` for chart data.
+- `Aggregate::populate(path | PopulateOptions)`: `$lookup` from the schema's `ref` / `virtualPopulate`, with
+  select (hidden fields stay hidden), match, sort, limit, nested populate, array order kept.
+- One-line reports: `Model::countBy`, `sumBy`, `avgBy`, `stats`, `latestPerGroup`.
+- Debugging: `Aggregate::toShell()` (paste into mongosh), `explain()`, `plan()` ("IXSCAN(...)" / "COLLSCAN").
+- `06_iot_dashboard` now also checks formulas, buckets, countBy, stats, pipeline populate and latestPerGroup.
+
+### Changed
+- A string passed where a filter is expected is now parsed as a formula (it used to be ignored and match
+  everything).
+
 ## [0.3.0] - 2026-11-18
 
 ### Added

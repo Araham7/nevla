@@ -66,6 +66,7 @@ int main() {
 31. [Open-source karne ke steps](#31-open-source-karne-ke-steps)
 32. [v0.2 me kya naya hai](#32-v02-me-kya-naya-hai-short-me)
 33. [Aggregation builder (v0.3)](#33-aggregation-builder-v03--aasaan-pipeline)
+34. [v0.4: formula, time buckets, reports, pipeline populate](#34-v04-formula-time-buckets-ek-line-reports-pipeline-me-populate-debugging)
 
 ---
 
@@ -155,7 +156,7 @@ target_link_libraries(myapp PRIVATE nevla::nevla)
 
 ```cmake
 include(FetchContent)
-FetchContent_Declare(nevla GIT_REPOSITORY https://github.com/<tum>/nevla.git GIT_TAG v0.3.0)
+FetchContent_Declare(nevla GIT_REPOSITORY https://github.com/<tum>/nevla.git GIT_TAG v0.4.0)
 FetchContent_MakeAvailable(nevla)
 target_link_libraries(myapp PRIVATE nevla::nevla)
 ```
@@ -1238,7 +1239,7 @@ nevla/
 │   ├── 04_typed_struct.cc    NEVLA_STRUCT
 │   ├── 06_iot_dashboard.cc   end-to-end: threads se data bhejo + dashboard, har number verify
 │   └── 05_features.cc        v0.2: statics, plugin, Map, getters, virtual populate, paginate, cursor, bulkWrite
-├── tests/test.cc      377 checks, asli MongoDB par
+├── tests/test.cc      471 checks, asli MongoDB par
 ├── CMakeLists.txt
 ├── LICENSE            MIT
 └── README.md
@@ -1246,7 +1247,7 @@ nevla/
 
 ```bash
 cd build
-./nevla_tests        # "377 passed, 0 failed"
+./nevla_tests        # "471 passed, 0 failed"
 ./01_quickstart
 ./02_blog
 ./03_iot
@@ -1266,11 +1267,11 @@ CMake options: `-DNEVLA_BUILD_TESTS=OFF -DNEVLA_BUILD_EXAMPLES=OFF` (sirf librar
 3. GitHub par repo banao aur push karo:
    ```bash
    cd nevla
-   git init && git add . && git commit -m "nevla v0.3.0"
+   git init && git add . && git commit -m "nevla v0.4.0"
    git branch -M main
    git remote add origin https://github.com/<tum>/nevla.git
    git push -u origin main
-   git tag v0.3.0 && git push --tags
+   git tag v0.4.0 && git push --tags
    ```
 4. English README (`README.md`) ready hai; ye Hinglish guide `docs/` me hai.
 5. `.github/workflows/ci.yml` pehle se hai: har push par driver build karke MongoDB ke saath `nevla_tests` chalata hai. README ke badge me `<your-username>` badal do.
@@ -1433,6 +1434,87 @@ dobara chala leta hai.
 
 Poora end-to-end test: `./build/06_iot_dashboard 12500`. Ye 8 threads se 1 lakh readings bhejta hai,
 saath me dashboard queries chalata hai, aur aakhir me har count/sum/avg/min/max ko bheje gaye data se milata hai.
+
+---
+
+## 34. v0.4: formula, time buckets, ek-line reports, pipeline me populate, debugging
+
+### Formula string (sabse aasaan tareeka)
+
+MongoDB ke `{"$gt": ...}` waale objects ki jagah normal maths / C++ jaisi condition likho:
+
+```cpp
+User.find("age >= 18 && role in ['admin', 'editor']").exec();
+User.countDocuments("plan == 'pro' || credits > 0");
+User.updateMany("lastSeen < date('2026-01-01')", {{"active", false}});
+
+Order.aggregate()
+    .match("status == 'paid' && createdAt >= date('2026-11-01')")
+    .addField("total", "price * qty * (1 - discount)")
+    .group("customer", {sum("total"), sum("price * qty").as("gross"), count()})
+    .exec();
+```
+
+- **Kya-kya likh sakte ho:** `+ - * / %`, `== != < <= > >=` (akela `=` bhi chalega), `in [..]`, `not in [..]`, `&& || !` (ya `and or not`), `'text'`, `date('2026-11-17')`, `now()`.
+- **Functions:** `round`, `abs`, `min`, `max`, `if(cond, a, b)`, `concat`, `lower`, `year(at, 'Asia/Kolkata')`, `dateDiff(a, b, 'day')`, `size`, `exists(field)` ... Poori list English README me hai.
+- **Speed:** `field > 30` jaise hisse normal filter bante hain, isliye index use hota hai aur string date bhi `Date` me cast hoti hai. Sirf `used > limit` (field vs field) jaise hisse `$expr` bante hain.
+- **Galti:** galat formula par `FormulaError` aata hai, column number aur `^` nishaan ke saath:
+  ```
+  formula error at column 9: unexpected '*'
+    price * * qty
+            ^
+  ```
+- **Accumulator me formula:** naam dena zaroori hai, jaise `sum("price * qty").as("revenue")`.
+
+### Chart ke liye time buckets: `bucketByTime`
+
+```cpp
+Reading.aggregate()
+    .match({{"device", id}})
+    .bucketByTime("at", "15m", {avg("value"), max("value"), count()})
+    .exec();
+// [{time: 10:00, avgValue: .., maxValue: .., count: ..}, {time: 10:15, ...}]   time ke kram me
+
+// har device ki alag line, Indian time ke din, khaali ghante bhi (count 0) taaki graph me gap na dikhe
+Reading.aggregate().bucketByTime("at", "1h", {avg("value")},
+                                 {.by = "device", .timezone = "Asia/Kolkata", .fillGaps = true}).exec();
+```
+
+Interval aise likh sakte ho: `"30s" "15m" "1h" "1d" "1w" "1M"` (M = month), `"1y"`, ya `"2 hours"`.
+
+### Ek line ki reports
+
+```cpp
+Order.countBy("status");                 // {"paid": 120, "pending": 8}   (sabse bada pehle)
+Order.sumBy("customer", "amount");       // har customer ka total
+Reading.avgBy("device", "value");        // har device ki average
+Reading.stats("value");                  // {count, sum, avg, min, max, stdDev}
+Reading.latestPerGroup("device", "at");  // har device ki sabse nayi reading
+```
+
+Sabme filter bhi de sakte ho: `Order.countBy("status", "createdAt >= date('2026-11-01')")`.
+
+### Pipeline ke andar populate
+
+```cpp
+Reading.aggregate().populate("device").group("device.room", {avg("value"), count()}).exec();
+Author.aggregate().populate("posts").addField("postCount", "size(posts)").sort("-postCount").exec();
+```
+
+- `$lookup` nevla schema ke `ref` se khud bana deta hai; `select`, `match`, `sort`, `limit` aur nested populate sab chalte hain.
+- Ise `group()`/`project()` se **pehle** lagao.
+- Array ke andar ke sub-documents (`comments.by`) ke liye `find().populate()` use karo.
+
+### Debugging
+
+```cpp
+auto agg = Reading.aggregate().match("value > 50").group("device", {count()});
+std::cout << agg.toShell();   // db.getCollection("readings").aggregate([...])  -> mongosh me paste karo
+std::cout << agg.plan();      // "IXSCAN(value_1)" = index laga;  "COLLSCAN" = poori collection padhi, index banao
+```
+
+Is version ko `06_iot_dashboard` se bhi test kiya: 8 threads ne 1 lakh readings bheji, 5 threads ek saath dashboards
+chala rahe the, aur formula, buckets, countBy, stats, populate, sabke result bheje gaye data se match hue.
 
 ---
 

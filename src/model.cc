@@ -116,6 +116,22 @@ auto guard(F &&f) -> decltype(f()) {
     }
 }
 
+// A read whose plan the server killed (collection created / dropped / index built mid-query) is safe to run again.
+// Not inside a transaction (the driver retries the whole transaction there).
+template <class F>
+void retryRead(F &&fn) {
+    for (int attempt = 1;; ++attempt) {
+        try {
+            fn();
+            return;
+        } catch (const mongocxx::operation_exception &e) {
+            int code = e.code().value();
+            bool transient = code == 175 /* QueryPlanKilled */ || code == 237 /* CursorKilled */;
+            if (!transient || attempt >= 3 || tTx.client) throw;
+        }
+    }
+}
+
 void debugLog(const std::string &coll, const std::string &op, const Value &args) {
     if (!gDebug.load()) return;
     std::function<void(const std::string &, const std::string &, const Value &)> fn;
@@ -763,8 +779,11 @@ std::vector<Value> runFind(const std::shared_ptr<ModelImpl> &m, const detail::Qu
     guard([&] {
         Op o = open(*m);
         debugLog(m->collection, opName, Value{{"filter", filter}, {"sort", spec.sort}, {"limit", spec.limit}});
-        auto cursor = NV(o, find, toBson(filter), opts);
-        for (auto &&doc : cursor) out.push_back(fromBson(doc));
+        retryRead([&] {
+            out.clear();
+            auto cursor = NV(o, find, toBson(filter), opts);
+            for (auto &&doc : cursor) out.push_back(fromBson(doc));
+        });
     });
     if (!spec.populate.empty() && !out.empty()) {
         std::vector<Value *> ptrs;
@@ -1776,33 +1795,296 @@ std::vector<Value> Model::distinct(const std::string &field, const Value &filter
     return runDistinct(m_, field, filter);
 }
 
-std::vector<Value> Model::aggregate(const Value &pipelineIn) const {
-    Value stages = pipelineIn.isArray() ? pipelineIn : Value::array();
-    runQueryHooks(*m_, "aggregate", stages, nullptr);
+namespace {
+// Stages after which documents no longer have the schema's shape: later $match stages are not cast
+bool reshapes(const std::string &stageName) {
+    static const std::set<std::string> keep = {"$match", "$sort", "$limit", "$skip", "$sample", "$unwind", "$lookup"};
+    return keep.count(stageName) == 0;
+}
+
+// Cast the $match stages that still see schema-shaped documents (Mongoose does not do this)
+Value castPipeline(ModelImpl &m, const Value &stages) {
+    Value out = Value::array();
+    bool reshaped = false;
+    for (const auto &st : stages.elements()) {
+        if (!st.isObject() || st.size() != 1) {
+            out.push_back(st);
+            reshaped = true;
+            continue;
+        }
+        const std::string &name = st.items()[0].first;
+        if (name == "$match" && !reshaped && st.items()[0].second.isObject()) {
+            Value cast = Value::object();
+            cast["$match"] = castFilter(m.schema, st.items()[0].second);
+            out.push_back(std::move(cast));
+        } else {
+            out.push_back(st);
+        }
+        if (reshapes(name)) reshaped = true;
+    }
+    return out;
+}
+
+std::vector<Value> runAggregate(const std::shared_ptr<ModelImpl> &m, Value stages, const AggregateOptions &o) {
+    runQueryHooks(*m, "aggregate", stages, nullptr);
     mongocxx::pipeline p;
-    if (!m_->discKey.empty()) {
+    if (!m->discKey.empty()) {
         Value match = Value::object();
-        match["$match"][m_->discKey] = m_->discValue;
+        match["$match"][m->discKey] = m->discValue;
         p.append_stage(toBson(match));
     }
-    for (const auto &stage : stages.elements()) p.append_stage(toBson(stage));
+    for (const auto &stage : stages.elements()) {
+        if (!stage.isObject()) throw Error("nevla: every aggregation stage must be an object, got " + stage.toJson());
+        p.append_stage(toBson(stage));
+    }
+    mongocxx::options::aggregate opts;
+    if (o.allowDiskUse) opts.allow_disk_use(true);
+    if (o.maxTimeMS > 0) opts.max_time(std::chrono::milliseconds(o.maxTimeMS));
+    if (o.collation.isObject()) opts.collation(toBson(o.collation));
+    if (o.hint.isString()) opts.hint(mongocxx::hint(o.hint.asString()));
+    if (o.hint.isObject()) opts.hint(mongocxx::hint(toBson(o.hint)));
     std::vector<Value> out;
     guard([&] {
-        Op o = open(*m_);
-        debugLog(m_->collection, "aggregate", stages);
-        mongocxx::options::aggregate opts;
-        auto cursor = NV(o, aggregate, p, opts);
-        for (auto &&doc : cursor) out.push_back(fromBson(doc));
+        Op op = open(*m);
+        debugLog(m->collection, "aggregate", stages);
+        bool writes = false;  // $out / $merge must not run twice
+        for (const auto &st : stages.elements()) writes |= st.contains("$out") || st.contains("$merge");
+        auto run = [&] {
+            out.clear();
+            auto cursor = NV(op, aggregate, p, opts);
+            for (auto &&doc : cursor) out.push_back(fromBson(doc));
+        };
+        if (writes)
+            run();
+        else
+            retryRead(run);
     });
-    if (hasPostHooks(*m_, "aggregate")) {
+    if (hasPostHooks(*m, "aggregate")) {
         Value result = Value::array();
         for (auto &v : out) result.push_back(std::move(v));
-        runPostHooks(*m_, "aggregate", stages, nullptr, result);
+        runPostHooks(*m, "aggregate", stages, nullptr, result);
         out.clear();
         for (auto &v : result.elements()) out.push_back(std::move(v));
     }
     return out;
 }
+
+std::string fieldRef(const std::string &field) {
+    if (field.empty()) throw Error("nevla: accumulator needs a field name");
+    return field[0] == '$' ? field : "$" + field;
+}
+
+// avg + "reading.temp" -> "avgReadingTemp"
+std::string accName(const std::string &op, const std::string &field) {
+    std::string out = op;
+    bool upper = true;
+    for (char c : field) {
+        if (c == '$') continue;
+        if (c == '.' || c == '_') {
+            upper = true;
+            continue;
+        }
+        out += upper ? static_cast<char>(std::toupper(static_cast<unsigned char>(c))) : c;
+        upper = false;
+    }
+    return out;
+}
+
+Accumulator makeAcc(const char *op, const std::string &field) {
+    return Accumulator{std::string("$") + op, Value(fieldRef(field)), accName(op, field)};
+}
+}  // namespace
+
+Accumulator sum(const std::string &field) { return makeAcc("sum", field); }
+Accumulator avg(const std::string &field) { return makeAcc("avg", field); }
+Accumulator min(const std::string &field) { return makeAcc("min", field); }
+Accumulator max(const std::string &field) { return makeAcc("max", field); }
+Accumulator first(const std::string &field) { return makeAcc("first", field); }
+Accumulator last(const std::string &field) { return makeAcc("last", field); }
+Accumulator push(const std::string &field) { return makeAcc("push", field); }
+Accumulator addToSet(const std::string &field) { return makeAcc("addToSet", field); }
+Accumulator stdDevPop(const std::string &field) { return makeAcc("stdDevPop", field); }
+Accumulator count() { return Accumulator{"$sum", Value(1), "count"}; }
+Accumulator accumulator(const std::string &op, Value expr, std::string name) {
+    return Accumulator{op.empty() || op[0] == '$' ? op : "$" + op, std::move(expr), std::move(name)};
+}
+
+/* ======================= Aggregate ======================= */
+Aggregate &Aggregate::match(const Value &filter) {
+    if (!filter.isObject()) throw Error("nevla: aggregate().match() needs an object");
+    Value st = Value::object();
+    st["$match"] = reshaped_ ? filter : castFilter(m_->schema, filter);
+    stages_.push_back(std::move(st));
+    return *this;
+}
+
+Aggregate &Aggregate::group(const std::string &by, std::vector<Accumulator> accumulators) {
+    std::vector<std::string> keys;
+    std::istringstream in(by);
+    std::string tok;
+    while (in >> tok) {
+        if (tok[0] == '$') tok = tok.substr(1);
+        keys.push_back(reshaped_ ? tok : m_->schema.resolveAlias(tok));
+    }
+    Value g = Value::object();
+    if (keys.empty()) {
+        g["_id"] = Value();
+    } else if (keys.size() == 1) {
+        g["_id"] = "$" + keys[0];
+    } else {
+        Value id = Value::object();
+        for (const auto &k : keys) id[k.substr(k.rfind('.') + 1)] = "$" + k;
+        g["_id"] = std::move(id);
+    }
+    for (auto &a : accumulators) {
+        if (a.name.empty() || a.name == "_id") throw Error("nevla: group(): every accumulator needs an output name");
+        if (g.contains(a.name))
+            throw Error("nevla: group(): two accumulators are both named \"" + a.name + "\" (use .as(\"other\"))");
+        Value expr = a.expr;
+        if (!reshaped_ && expr.isString() && expr.asString().size() > 1 && expr.asString()[0] == '$')
+            expr = "$" + m_->schema.resolveAlias(expr.asString().substr(1));
+        g[a.name][a.op] = std::move(expr);
+    }
+    Value st = Value::object();
+    st["$group"] = std::move(g);
+    stages_.push_back(std::move(st));
+    reshaped_ = true;
+    return *this;
+}
+
+Aggregate &Aggregate::sort(const Value &spec) {
+    Value st = Value::object();
+    st["$sort"] = detail::parseSort(spec);
+    if (st["$sort"].empty()) throw Error("nevla: aggregate().sort() needs at least one field");
+    stages_.push_back(std::move(st));
+    return *this;
+}
+
+Aggregate &Aggregate::limit(int64_t n) {
+    if (n <= 0) throw Error("nevla: aggregate().limit() must be > 0");
+    stages_.push_back(Value{{"$limit", n}});
+    return *this;
+}
+
+Aggregate &Aggregate::skip(int64_t n) {
+    if (n < 0) throw Error("nevla: aggregate().skip() must be >= 0");
+    stages_.push_back(Value{{"$skip", n}});
+    return *this;
+}
+
+Aggregate &Aggregate::project(const Value &spec) {
+    Value proj = Value::object();
+    if (spec.isString()) {
+        std::istringstream in(spec.asString());
+        std::string tok;
+        while (in >> tok) {
+            if (tok[0] == '-')
+                proj[tok.substr(1)] = 0;
+            else
+                proj[tok[0] == '+' ? tok.substr(1) : tok] = 1;
+        }
+    } else if (spec.isObject()) {
+        proj = spec;
+    } else {
+        throw Error("nevla: aggregate().project() needs \"a b -c\" or an object");
+    }
+    if (proj.empty()) throw Error("nevla: aggregate().project() needs at least one field");
+    stages_.push_back(Value{{"$project", proj}});
+    reshaped_ = true;
+    return *this;
+}
+
+Aggregate &Aggregate::addFields(const Value &fields) {
+    if (!fields.isObject() || fields.empty()) throw Error("nevla: aggregate().addFields() needs an object");
+    stages_.push_back(Value{{"$addFields", fields}});
+    reshaped_ = true;
+    return *this;
+}
+
+Aggregate &Aggregate::unwind(const std::string &path, bool keepEmpty) {
+    std::string p = path.empty() || path[0] != '$' ? "$" + path : path;
+    if (p.size() < 2) throw Error("nevla: aggregate().unwind() needs a path");
+    Value st = Value::object();
+    if (keepEmpty)
+        st["$unwind"] = Value{{"path", p}, {"preserveNullAndEmptyArrays", true}};
+    else
+        st["$unwind"] = p;
+    stages_.push_back(std::move(st));
+    return *this;
+}
+
+Aggregate &Aggregate::lookup(const std::string &from, const std::string &localField, const std::string &foreignField,
+                             const std::string &as) {
+    std::string coll = from;
+    {
+        std::lock_guard<std::mutex> lk(gModelsMu);
+        auto it = gModels.find(from);
+        if (it != gModels.end()) coll = it->second->collection;  // a model name -> its collection
+    }
+    stages_.push_back(Value{
+        {"$lookup", Value{{"from", coll}, {"localField", localField}, {"foreignField", foreignField}, {"as", as}}}});
+    return *this;
+}
+
+Aggregate &Aggregate::count(const std::string &as) {
+    if (as.empty() || as[0] == '$' || as.find('.') != std::string::npos)
+        throw Error("nevla: aggregate().count() needs a plain field name");
+    stages_.push_back(Value{{"$count", as}});
+    reshaped_ = true;
+    return *this;
+}
+
+Aggregate &Aggregate::sample(int64_t n) {
+    if (n <= 0) throw Error("nevla: aggregate().sample() must be > 0");
+    stages_.push_back(Value{{"$sample", Value{{"size", n}}}});
+    return *this;
+}
+
+Aggregate &Aggregate::replaceRoot(const std::string &path) {
+    std::string p = path.empty() || path[0] != '$' ? "$" + path : path;
+    stages_.push_back(Value{{"$replaceRoot", Value{{"newRoot", p}}}});
+    reshaped_ = true;
+    return *this;
+}
+
+Aggregate &Aggregate::stage(const Value &raw) {
+    if (!raw.isObject() || raw.size() != 1 || raw.items()[0].first.empty() || raw.items()[0].first[0] != '$')
+        throw Error("nevla: aggregate().stage() needs one stage like {{\"$facet\", {...}}}, got " + raw.toJson());
+    const std::string &name = raw.items()[0].first;
+    if (name == "$match") return match(raw.items()[0].second);
+    stages_.push_back(raw);
+    if (reshapes(name)) reshaped_ = true;
+    return *this;
+}
+
+Aggregate &Aggregate::options(AggregateOptions o) {
+    opts_ = std::move(o);
+    return *this;
+}
+
+Value Aggregate::pipeline() const {
+    Value out = Value::array();
+    if (!m_->discKey.empty()) out.push_back(Value{{"$match", Value{{m_->discKey, m_->discValue}}}});
+    for (const auto &st : stages_.elements()) out.push_back(st);
+    return out;
+}
+
+std::vector<Value> Aggregate::exec() const { return runAggregate(m_, stages_, opts_); }
+
+std::optional<Value> Aggregate::first() const {
+    Value st = stages_;
+    st.push_back(Value{{"$limit", 1}});
+    auto rows = runAggregate(m_, st, opts_);
+    if (rows.empty()) return std::nullopt;
+    return std::move(rows[0]);
+}
+
+std::vector<Value> Model::aggregate(const Value &pipelineIn) const {
+    if (!pipelineIn.isArray()) throw Error("nevla: aggregate() needs an array of stages (Value::array({...}))");
+    return runAggregate(m_, castPipeline(*m_, pipelineIn), AggregateOptions{});
+}
+
+Aggregate Model::aggregate() const { return Aggregate(m_); }
 
 ChangeStream Model::watch(const Value &pipeline, WatchOptions options) const {
     auto impl = std::make_shared<ChangeStreamImpl>();

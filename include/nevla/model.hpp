@@ -21,6 +21,7 @@ namespace nevla {
 struct ModelImpl;
 struct CursorImpl;
 struct ChangeStreamImpl;
+class Aggregate;
 class Model;
 
 /* ---------------- Connection ---------------- */
@@ -338,6 +339,86 @@ class ChangeStream {
     std::shared_ptr<ChangeStreamImpl> impl_;
 };
 
+/* ---------------- Aggregation builder ----------------
+   Point.aggregate()
+       .match({{"device", id}, {"at", {{"$gte", "2026-11-17"}}}})   // cast with the schema (string id -> ObjectId ...)
+       .group("device", {avg("value"), max("value"), count()})      // -> {_id, avgValue, maxValue, count}
+       .sort("-avgValue")
+       .limit(5)
+       .exec();                                                     */
+
+// One accumulator of group():  avg("value") -> output field "avgValue" = {$avg: "$value"}
+struct Accumulator {
+    std::string op;                            // "$avg", "$sum", ...
+    Value expr;                                // "$value" or 1
+    std::string name;                          // output field
+    Accumulator &as(std::string outputName) {  // avg("value").as("meanTemp")
+        name = std::move(outputName);
+        return *this;
+    }
+};
+Accumulator sum(const std::string &field);  // field: "value", "reading.temp" or an expression string "$value"
+Accumulator avg(const std::string &field);
+Accumulator min(const std::string &field);
+Accumulator max(const std::string &field);
+Accumulator first(const std::string &field);  // first value in the group (after sort())
+Accumulator last(const std::string &field);
+Accumulator push(const std::string &field);      // array of all values
+Accumulator addToSet(const std::string &field);  // array of distinct values
+Accumulator count();                             // number of documents -> "count"
+Accumulator stdDevPop(const std::string &field);
+Accumulator accumulator(const std::string &op, Value expr, std::string name);  // anything else: ("$top", {...}, "x")
+
+struct AggregateOptions {
+    bool allowDiskUse = false;  // big $group / $sort may use disk
+    int64_t maxTimeMS = 0;
+    Value collation;
+    Value hint;
+};
+
+class Aggregate {
+  public:
+    // $match. Cast with the schema while the documents still have the schema's shape
+    // (i.e. before group / project / addFields / replaceRoot / raw stage). Throws CastError on bad values.
+    Aggregate &match(const Value &filter);
+    // $group by "" (everything), "device", or several fields "device type" -> _id {device, type}
+    Aggregate &group(const std::string &by, std::vector<Accumulator> accumulators = {});
+    Aggregate &sort(const Value &spec);  // "-avgValue name" or {{"avgValue", -1}}
+    Aggregate &limit(int64_t n);
+    Aggregate &skip(int64_t n);
+    Aggregate &project(const Value &spec);  // "name email -_id" or {{"total", {{"$multiply", ...}}}}
+    Aggregate &project(const char *spec) { return project(Value(spec)); }
+    Aggregate &addFields(const Value &fields);  // {{"total", {{"$multiply", Value::array({"$price", "$qty"})}}}}
+    Aggregate &unwind(const std::string &path, bool keepEmpty = false);  // "tags" or "$tags"
+    // $lookup: `from` may be a model name ("Author") or a collection name
+    Aggregate &lookup(const std::string &from, const std::string &localField, const std::string &foreignField,
+                      const std::string &as);
+    Aggregate &count(const std::string &as = "count");  // $count: one document {as: n}
+    Aggregate &sample(int64_t n);
+    Aggregate &replaceRoot(const std::string &path);  // "$doc" or "doc"
+    Aggregate &stage(const Value &rawStage);          // anything else: {{"$facet", {...}}}
+    Aggregate &options(AggregateOptions o);
+
+    std::vector<Value> exec() const;
+    template <class T>
+    std::vector<T> exec() const {  // results into NEVLA_STRUCT structs (group key "_id" -> member "id")
+        std::vector<T> out;
+        for (auto &v : exec()) out.push_back(v.template as<T>());
+        return out;
+    }
+    std::optional<Value> first() const;  // only the first result (adds $limit 1)
+    Value pipeline() const;              // the stages as they will be sent (incl. discriminator $match)
+    std::string toJson(int indent = 2) const { return pipeline().toJson(indent); }
+
+  private:
+    friend class Model;
+    explicit Aggregate(std::shared_ptr<ModelImpl> m) : m_(std::move(m)) {}
+    std::shared_ptr<ModelImpl> m_;
+    Value stages_ = Value::array();
+    bool reshaped_ = false;  // after this the schema no longer describes the documents
+    AggregateOptions opts_;
+};
+
 /* ---------------- Model ---------------- */
 class Model {
   public:
@@ -382,7 +463,8 @@ class Model {
     int64_t estimatedDocumentCount() const;
     bool exists(const Value &filter) const;
     std::vector<Value> distinct(const std::string &field, const Value &filter = Value::object()) const;
-    std::vector<Value> aggregate(const Value &pipeline) const;  // pipeline = array of stages
+    std::vector<Value> aggregate(const Value &pipeline) const;  // raw stages ($match stages are cast too)
+    Aggregate aggregate() const;                                // chainable builder (see Aggregate)
 
     ChangeStream watch(const Value &pipeline = Value::array(), WatchOptions options = {}) const;  // replica set
 

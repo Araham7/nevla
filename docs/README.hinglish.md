@@ -65,6 +65,7 @@ int main() {
 30. [Tests, examples, folder](#30-tests-examples-folder)
 31. [Open-source karne ke steps](#31-open-source-karne-ke-steps)
 32. [v0.2 me kya naya hai](#32-v02-me-kya-naya-hai-short-me)
+33. [Aggregation builder (v0.3)](#33-aggregation-builder-v03--aasaan-pipeline)
 
 ---
 
@@ -154,7 +155,7 @@ target_link_libraries(myapp PRIVATE nevla::nevla)
 
 ```cmake
 include(FetchContent)
-FetchContent_Declare(nevla GIT_REPOSITORY https://github.com/<tum>/nevla.git GIT_TAG v0.2.0)
+FetchContent_Declare(nevla GIT_REPOSITORY https://github.com/<tum>/nevla.git GIT_TAG v0.3.0)
 FetchContent_MakeAvailable(nevla)
 target_link_libraries(myapp PRIVATE nevla::nevla)
 ```
@@ -653,7 +654,7 @@ for (const auto &row : stats)
     std::cout << row["_id"].asString() << ": " << row["count"].asInt() << ", avg " << row["avgAge"].asDouble() << "\n";
 ```
 
-> `aggregate` ke stages jaise ke taise MongoDB ko jaate hain (schema cast nahi hota), Mongoose ki tarah.
+> v0.3 se `aggregate` ke `$match` stages bhi schema se cast hote hain (string id → ObjectId, date string → Date). Detail: section 33.
 
 ---
 
@@ -1235,8 +1236,9 @@ nevla/
 │   ├── 02_blog.cc            populate, hooks, virtuals, methods
 │   ├── 03_iot.cc             custom _id, discriminators, TTL, aggregate, transaction
 │   ├── 04_typed_struct.cc    NEVLA_STRUCT
+│   ├── 06_iot_dashboard.cc   end-to-end: threads se data bhejo + dashboard, har number verify
 │   └── 05_features.cc        v0.2: statics, plugin, Map, getters, virtual populate, paginate, cursor, bulkWrite
-├── tests/test.cc      331 checks, asli MongoDB par
+├── tests/test.cc      377 checks, asli MongoDB par
 ├── CMakeLists.txt
 ├── LICENSE            MIT
 └── README.md
@@ -1244,7 +1246,7 @@ nevla/
 
 ```bash
 cd build
-./nevla_tests        # "331 passed, 0 failed"
+./nevla_tests        # "377 passed, 0 failed"
 ./01_quickstart
 ./02_blog
 ./03_iot
@@ -1264,11 +1266,11 @@ CMake options: `-DNEVLA_BUILD_TESTS=OFF -DNEVLA_BUILD_EXAMPLES=OFF` (sirf librar
 3. GitHub par repo banao aur push karo:
    ```bash
    cd nevla
-   git init && git add . && git commit -m "nevla v0.2.0"
+   git init && git add . && git commit -m "nevla v0.3.0"
    git branch -M main
    git remote add origin https://github.com/<tum>/nevla.git
    git push -u origin main
-   git tag v0.2.0 && git push --tags
+   git tag v0.3.0 && git push --tags
    ```
 4. English README (`README.md`) ready hai; ye Hinglish guide `docs/` me hai.
 5. `.github/workflows/ci.yml` pehle se hai: har push par driver build karke MongoDB ke saath `nevla_tests` chalata hai. README ke badge me `<your-username>` badal do.
@@ -1349,6 +1351,88 @@ positional paths (`items.$.qty`, `items.$[].qty`) cast hote hain, aur `createdAt
 **Robustness:** `connect()` dobara bulana (reconnect) chalte hue operations ke beech bhi safe hai; collection
 naam ab Mongoose jaisa (`Person` → `people`, `Category` → `categories`); invalid regex aur galat date
 (`2026-02-30`) pehle hi pakad liye jaate hain.
+
+---
+
+## 33. Aggregation builder (v0.3) — aasaan pipeline
+
+**Pipeline kya hai:** documents ek line me kai stages se guzarte hain (filter → group → sort → limit).
+Har stage ek kaam karti hai aur result aage deti hai. Saara hisaab MongoDB server par hota hai, tumhare program
+me sirf chhota result aata hai.
+
+Pehle aisa likhna padta tha (bahut brackets, `"$field"` strings, `ObjectId(...)` khud banana):
+
+```cpp
+Point.aggregate(Value::array({
+    {{"$match", {{"device", ObjectId(id)}, {"at", {{"$gte", *Date::parse("2026-11-17")}}}}}},
+    {{"$group", {{"_id", "$device"}, {"avgValue", {{"$avg", "$value"}}}, {"count", {{"$sum", 1}}}}}},
+    {{"$sort", {{"avgValue", -1}}}},
+}));
+```
+
+Ab bas itna:
+
+```cpp
+auto top = Point.aggregate()
+    .match({{"device", id}, {"at", {{"$gte", "2026-11-17"}}}})   // string id / date string apne aap cast
+    .group("device", {avg("value"), max("value"), count()})      // -> {_id, avgValue, maxValue, count}
+    .sort("-avgValue")
+    .limit(5)
+    .exec();
+```
+
+**Auto-cast (Mongoose me nahi hai):** `$match` me string id → `ObjectId`, `"2026-11-17"` → `Date`, `"10"` → `10`,
+alias → asli naam. Ye builder aur haath se likhe `aggregate(Value::array(...))` dono me hota hai.
+`group` / `project` / `addFields` ke baad cast band ho jaata hai (kyunki tab fields schema jaise nahi rehte).
+Galat value (`match({{"value", "garam"}})`) par turant `CastError` aata hai, chupchap khaali result nahi.
+
+**Group ke accumulators:**
+
+| Likho | Result field |
+|---|---|
+| `count()` | `count` |
+| `sum("value")`, `avg("value")` | `sumValue`, `avgValue` |
+| `min("value")`, `max("value")` | `minValue`, `maxValue` |
+| `first("value")`, `last("value")` | `firstValue`, `lastValue` (pehle `sort()` lagao) |
+| `push("value")`, `addToSet("tag")` | array |
+| `avg("value").as("meanTemp")` | apna naam |
+
+```cpp
+.group("device room", {count()})     // do keys -> _id: {device, room}
+.group("", {sum("amount")})          // poori collection
+```
+
+**Baaki stages:** `sort`, `limit`, `skip`, `sample`, `project("a b -_id")`, `addFields({...})`,
+`unwind("tags")`, `lookup("Device", "device", "_id", "dev")` (model ka naam bhi chalega), `count("n")`,
+`replaceRoot("doc")`, aur koi bhi stage kachcha: `stage({{"$facet", {...}}})`.
+
+**Result lena:**
+
+```cpp
+agg.exec();                 // std::vector<Value>
+agg.first();                // sirf pehla (optional)
+agg.exec<DeviceStat>();     // seedha NEVLA_STRUCT me (group key "_id" -> member "id")
+std::cout << agg.toJson();  // jo pipeline jaayegi wo dekho (mongosh me paste kar sakte ho)
+```
+
+**Room-wise report (join ke saath):**
+
+```cpp
+auto rooms = Reading.aggregate()
+    .match({{"at", {{"$gte", "2026-11-01"}}}})
+    .lookup("Device", "device", "_id", "dev")
+    .unwind("dev")
+    .group("dev.room", {avg("value"), count()})
+    .sort("-avgValue")
+    .exec();
+```
+
+Tip: `match()` jitna pehle ho sake lagao: index use hota hai aur aage kam data jaata hai.
+Agar query chalte waqt collection ban/hat jaaye aur server `QueryPlanKilled` de, to nevla read ko apne aap
+dobara chala leta hai.
+
+Poora end-to-end test: `./build/06_iot_dashboard 12500`. Ye 8 threads se 1 lakh readings bhejta hai,
+saath me dashboard queries chalata hai, aur aakhir me har count/sum/avg/min/max ko bheje gaye data se milata hai.
 
 ---
 

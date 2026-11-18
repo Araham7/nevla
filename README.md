@@ -54,7 +54,7 @@ Hindi/Hinglish guide: [docs/README.hinglish.md](docs/README.hinglish.md)
 12. [Updating](#updating)
 13. [Deleting](#deleting)
 14. [Bulk writes](#bulk-writes)
-15. [Aggregation, distinct, counting](#aggregation-distinct-counting)
+15. [Aggregation builder](#aggregation-builder) · [Distinct and counting](#distinct-and-counting)
 16. [Sub-documents, arrays and maps](#sub-documents-arrays-and-maps)
 17. [Populate](#populate)
 18. [Middleware (hooks)](#middleware-hooks)
@@ -90,6 +90,7 @@ nevla gives C++ the developer experience of Mongoose:
 | Change tracking | `doc.set(...).save()` only sends the changed paths |
 | Chainable queries | `User.find().where("age").gte(18).sort("-age").limit(10).exec()` |
 | Relations | `populate("author")`, nested populate, virtual populate |
+| Easy aggregation | `aggregate().match(...).group("device", {avg("value")}).exec()` with automatic casting |
 | Middleware | `pre/post` hooks for `save`, `validate`, `find`, `updateOne`, `aggregate`, ... |
 | Real-world features | transactions, change streams, bulk writes, cursors, pagination, optimistic concurrency |
 | C++ comfort | `NEVLA_STRUCT` maps your structs to documents at compile time |
@@ -171,7 +172,7 @@ target_link_libraries(myapp PRIVATE nevla::nevla)
 
 ```cmake
 include(FetchContent)
-FetchContent_Declare(nevla GIT_REPOSITORY https://github.com/<your-username>/nevla.git GIT_TAG v0.2.0)
+FetchContent_Declare(nevla GIT_REPOSITORY https://github.com/<your-username>/nevla.git GIT_TAG v0.3.0)
 FetchContent_MakeAvailable(nevla)
 target_link_libraries(myapp PRIVATE nevla::nevla)
 ```
@@ -179,7 +180,7 @@ target_link_libraries(myapp PRIVATE nevla::nevla)
 **C. After `cmake --install`**
 
 ```cmake
-find_package(nevla 0.2 CONFIG REQUIRED)
+find_package(nevla 0.3 CONFIG REQUIRED)
 target_link_libraries(myapp PRIVATE nevla::nevla)
 ```
 
@@ -534,15 +535,138 @@ Inserted documents are validated; updates and filters are cast exactly like `upd
 
 ---
 
-## Aggregation, distinct, counting
+## Aggregation builder
+
+An aggregation **pipeline** sends your documents through a list of **stages**. Each stage does one job
+(filter, group, sort, ...) and hands its result to the next one. All the work happens inside MongoDB, so
+only the small final result comes back to your program.
+
+```
+all readings ──► match (filter) ──► group (avg / max / count) ──► sort ──► limit ──► result
+```
+
+Writing a pipeline by hand means many braces, `"$field"` strings and building `ObjectId`/`Date` yourself.
+nevla's builder makes it read like a `find()` query:
 
 ```cpp
-auto stats = Order.aggregate(Value::array({
-    {{"$match", {{"status", "paid"}}}},
-    {{"$group", {{"_id", "$customer"}, {"total", {{"$sum", "$amount"}}}}}},
-    {{"$sort", {{"total", -1}}}},
-}));
+auto top = Point.aggregate()
+    .match({{"device", deviceId}, {"at", {{"$gte", "2026-11-17"}}}})   // plain strings: cast for you
+    .group("device", {avg("value"), max("value"), count()})            // -> {_id, avgValue, maxValue, count}
+    .sort("-avgValue")
+    .limit(5)
+    .exec();                                                           // std::vector<Value>
 
+top[0]["_id"];        // the device id (the group key)
+top[0]["avgValue"];   // average of "value"
+```
+
+The same pipeline written by hand, for comparison:
+
+```cpp
+Point.aggregate(Value::array({
+    {{"$match", {{"device", ObjectId(deviceId)}, {"at", {{"$gte", *Date::parse("2026-11-17")}}}}}},
+    {{"$group", {{"_id", "$device"}, {"avgValue", {{"$avg", "$value"}}}, {"maxValue", {{"$max", "$value"}}},
+                 {"count", {{"$sum", 1}}}}}},
+    {{"$sort", {{"avgValue", -1}}}},
+    {{"$limit", 5}},
+}));
+```
+
+### Automatic casting (not in Mongoose)
+
+Mongoose never casts aggregation pipelines, so a string id in `$match` silently matches nothing.
+nevla casts every `$match` with the schema **while the documents still have the schema's shape**:
+
+- 24-hex string → `ObjectId`, `"2026-11-17"` → `Date`, `"10"` → `10` for number fields, aliases → real names;
+- works in the builder **and** in hand-written `aggregate(Value::array({...}))` pipelines;
+- stops after `group`, `project`, `addFields`, `replaceRoot`, `count` or a raw `stage(...)` (other than
+  `$match/$sort/$limit/$skip/$sample/$unwind/$lookup`), because the fields no longer match the schema;
+- a value that cannot be cast throws `CastError` right away (`match({{"value", "hot"}})`), instead of
+  quietly returning nothing.
+
+### Grouping
+
+```cpp
+.group("device", {avg("value"), min("value"), max("value"), sum("value"), count()})
+.group("device room", {count()})           // several keys -> _id: {device, room}
+.group("", {sum("amount")})                // the whole collection -> _id: null
+.group("dev.room", {avg("value")})         // a nested path (e.g. after lookup + unwind)
+```
+
+| Accumulator | MongoDB | Output field |
+|---|---|---|
+| `count()` | `{$sum: 1}` | `count` |
+| `sum("value")` | `{$sum: "$value"}` | `sumValue` |
+| `avg("value")` | `{$avg: "$value"}` | `avgValue` |
+| `min("value")`, `max("value")` | `$min`, `$max` | `minValue`, `maxValue` |
+| `first("value")`, `last("value")` | `$first`, `$last` (use `sort()` before) | `firstValue`, `lastValue` |
+| `push("value")`, `addToSet("tag")` | `$push`, `$addToSet` | `pushValue`, `addToSetTag` |
+| `stdDevPop("value")` | `$stdDevPop` | `stdDevPopValue` |
+| `accumulator("$top", expr, "name")` | anything else | `name` |
+
+Names come from the operation + the field in camelCase (`avg("reading.temp")` → `avgReadingTemp`).
+Choose your own with `.as()`: `avg("value").as("meanTemp")`. Two accumulators with the same name are an error.
+
+### All builder stages
+
+| Builder | Stage |
+|---|---|
+| `match(filter)` | `$match` (cast, see above) |
+| `group(by, {accumulators})` | `$group` |
+| `sort("-a b")` / `sort({{"a", -1}})` | `$sort` |
+| `limit(n)`, `skip(n)`, `sample(n)` | `$limit`, `$skip`, `$sample` |
+| `project("a b -_id")` / `project({{"total", expr}})` | `$project` |
+| `addFields({{"total", expr}})` | `$addFields` |
+| `unwind("tags")` / `unwind("tags", true)` | `$unwind` (`true` keeps documents with empty arrays) |
+| `lookup("Author", "author", "_id", "authorDoc")` | `$lookup` (a model name or a collection name) |
+| `count("n")` | `$count` |
+| `replaceRoot("doc")` | `$replaceRoot` |
+| `stage({{"$facet", {...}}})` | any other stage, as is |
+| `options({.allowDiskUse = true, .maxTimeMS = 5000, .collation = ..., .hint = ...})` | command options |
+
+Running it:
+
+```cpp
+std::vector<Value> rows = agg.exec();
+std::optional<Value> one = agg.first();              // adds $limit 1
+std::vector<DeviceStat> typed = agg.exec<DeviceStat>();   // NEVLA_STRUCT; the group key "_id" -> member "id"
+std::cout << agg.toJson();                           // the pipeline that will be sent (paste into mongosh)
+Value stages = agg.pipeline();
+```
+
+A full example: device report with a join.
+
+```cpp
+struct RoomStat {
+    std::string id;          // the room (group key)
+    double avgValue = 0;
+    int64_t count = 0;
+};
+NEVLA_STRUCT(RoomStat, id, avgValue, count)
+
+auto rooms = Reading.aggregate()
+    .match({{"at", {{"$gte", "2026-11-01"}}}})
+    .lookup("Device", "device", "_id", "dev")       // join the device of every reading
+    .unwind("dev")
+    .group("dev.room", {avg("value"), count()})
+    .sort("-avgValue")
+    .exec<RoomStat>();
+```
+
+Good to know:
+
+- Put `match()` as early as possible: it can use indexes and every later stage gets less data.
+- Discriminator models add a `$match` on their type automatically (`pipeline()` shows it).
+- `pre("aggregate")` / `post("aggregate")` hooks see the builder's pipeline too.
+- A read that the server interrupts because a collection was created or dropped during the query
+  (`QueryPlanKilled`) is retried automatically (not for `$out` / `$merge`, not inside transactions).
+- On Windows, define `NOMINMAX` before including `<windows.h>` so `min()` / `max()` are not macros.
+
+---
+
+## Distinct and counting
+
+```cpp
 Order.countDocuments({{"status", "paid"}});
 Order.find({{"status", "paid"}}).count();
 Order.estimatedDocumentCount();
@@ -550,8 +674,6 @@ Order.exists({{"_id", id}});
 Order.distinct("customer", {{"status", "paid"}});
 Order.find({{"status", "paid"}}).distinct("customer");
 ```
-
-Aggregation pipelines are not cast (same as Mongoose). Discriminator models prepend a `$match` on their type.
 
 ---
 
@@ -930,6 +1052,7 @@ C++ designated initializers must keep this order; write only the ones you need:
 | `schema.methods.x = fn` / `schema.statics.x = fn` | `schema.method("x", fn)` / `schema.static_("x", fn)` |
 | `schema.plugin(fn, opts)` | `schema.plugin(fn, opts)` |
 | `Model.discriminator('Sensor', schema)` | `Model.discriminator("Sensor", schema)` |
+| `Model.aggregate().match({...}).group({...})` | `Model.aggregate().match({...}).group("field", {avg("x")})` |
 | `Model.bulkWrite([...])` | `Model.bulkWrite({...})` |
 | `Model.watch()` | `Model.watch()` |
 | `Query.cursor()` | `Query.cursor()` |
@@ -972,18 +1095,20 @@ nevla/
 │   ├── 02_blog.cc           # populate, hooks, virtuals, methods
 │   ├── 03_iot.cc            # custom _id, discriminators, TTL, aggregate, transaction
 │   ├── 04_typed_struct.cc   # NEVLA_STRUCT
-│   └── 05_features.cc       # statics, plugins, Map, getters, virtual populate, paginate, cursor, bulkWrite
-├── tests/test.cc        # 331 checks against a real MongoDB
+│   ├── 05_features.cc       # statics, plugins, Map, getters, virtual populate, paginate, cursor, bulkWrite
+│   └── 06_iot_dashboard.cc  # end-to-end: 8 writer threads + live dashboards, every number verified
+├── tests/test.cc        # 377 checks against a real MongoDB
 ├── docs/README.hinglish.md
 ├── .github/workflows/ci.yml
 ├── CHANGELOG.md  CONTRIBUTING.md  LICENSE  CMakeLists.txt
 ```
 
 ```bash
-./build/nevla_tests                                         # "331 passed, 0 failed"
+./build/nevla_tests                                         # "377 passed, 0 failed"
 NEVLA_TEST_URI="mongodb://host:27017/?replicaSet=rs0" ./build/nevla_tests
 cd build && ctest
 ./build/05_features
+./build/06_iot_dashboard 12500        # 100,000 readings from 8 threads, checks every aggregate
 ```
 
 Tested on Ubuntu 24.04, g++ 13, mongocxx 3.10.2, MongoDB 8 (single-node replica set), also under

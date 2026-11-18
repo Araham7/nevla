@@ -1055,10 +1055,183 @@ static void testModelExtras() {
     B.dropCollection();
 }
 
+/* ============================ aggregation builder ============================ */
+static void testAggregateBuilderOffline() {
+    section("aggregate builder: pipeline + auto-cast (no DB)");
+    auto Reading = model("AggReadingOffline", Schema({{"device", Id()},
+                                                      {"value", Number()},
+                                                      {"at", DateTime()},
+                                                      {"tags", Array(String())},
+                                                      {"temp", Number().alias("t")}}));
+    std::string id = ObjectId::generate().str();
+    auto a = Reading.aggregate()
+                 .match({{"device", id}, {"at", {{"$gte", "2026-11-17"}}}, {"value", {{"$gt", "10"}}}})
+                 .group("device", {avg("value"), max("value"), count(), sum("t").as("total")})
+                 .sort("-avgValue")
+                 .limit(5);
+    Value p = a.pipeline();
+    CHECK(p.size() == 4);
+    const Value &m = p.at(0)["$match"];
+    CHECK(m["device"].isObjectId() && m["device"].str() == id);  // string -> ObjectId
+    CHECK(m["at"]["$gte"].isDate());                             // string -> Date
+    CHECK(m["value"]["$gt"].isInt() && m["value"]["$gt"].asInt() == 10);
+    const Value &g = p.at(1)["$group"];
+    CHECK(g["_id"].asString() == "$device");
+    CHECK(g["avgValue"]["$avg"].asString() == "$value");
+    CHECK(g["maxValue"]["$max"].asString() == "$value");
+    CHECK(g["count"]["$sum"].asInt() == 1);
+    CHECK(g["total"]["$sum"].asString() == "$temp");  // alias resolved + .as() name
+    CHECK(p.at(2)["$sort"]["avgValue"].asInt() == -1);
+    CHECK(p.at(3)["$limit"].asInt() == 5);
+    CHECK(a.toJson().find("$group") != std::string::npos);
+
+    // several group keys, whole-collection group, names from dotted paths
+    Value g2 = Reading.aggregate().group("device tags", {avg("reading.temp")}).pipeline().at(0)["$group"];
+    CHECK(g2["_id"]["device"].asString() == "$device" && g2["_id"]["tags"].asString() == "$tags");
+    CHECK(g2.contains("avgReadingTemp"));
+    CHECK(Reading.aggregate().group("", {count()}).pipeline().at(0)["$group"]["_id"].isNull());
+
+    // after $group the schema no longer applies: no casting
+    Value after = Reading.aggregate().group("device", {count()}).match({{"count", {{"$gt", "3"}}}}).pipeline();
+    CHECK(after.at(1)["$match"]["count"]["$gt"].isString());
+
+    // project / unwind / addFields / count / stage
+    Value q = Reading.aggregate().unwind("tags").project("value tags -_id").addFields({{"x", 1}}).count("n").pipeline();
+    CHECK(q.at(0)["$unwind"].asString() == "$tags");
+    CHECK(q.at(1)["$project"]["value"].asInt() == 1 && q.at(1)["$project"]["_id"].asInt() == 0);
+    CHECK(q.at(3)["$count"].asString() == "n");
+    CHECK(Reading.aggregate().unwind("tags", true).pipeline().at(0)["$unwind"]["preserveNullAndEmptyArrays"].asBool());
+    CHECK(Reading.aggregate().stage({{"$match", {{"device", id}}}}).pipeline().at(0)["$match"]["device"].isObjectId());
+
+    // mistakes are caught early with a clear message
+    CHECK_THROWS(Reading.aggregate().match({{"value", "abc"}}), CastError);
+    CHECK_THROWS(Reading.aggregate().group("device", {avg("value"), avg("value")}), Error);
+    CHECK_THROWS(Reading.aggregate().limit(0), Error);
+    CHECK_THROWS(Reading.aggregate().stage({{"notAStage", 1}}), Error);
+    CHECK_THROWS(Reading.aggregate().sort(""), Error);
+    CHECK_THROWS(Reading.aggregate().count("a.b"), Error);
+}
+
+struct DeviceStat {
+    std::string id;
+    double avgValue = 0, maxValue = 0;
+    int count = 0;
+};
+NEVLA_STRUCT(DeviceStat, id, avgValue, maxValue, count)
+
+static void testAggregateBuilderDb() {
+    section("aggregate builder: real data");
+    auto Dev = model("AggDevice", Schema({{"name", String()}, {"room", String()}}));
+    auto Reading = model(
+        "AggReading",
+        Schema({{"device", Id().ref("AggDevice")}, {"value", Number()}, {"at", DateTime()}, {"tags", Array(String())}},
+               {.versionKey = ""}));
+    Dev.dropCollection();
+    Reading.dropCollection();
+    auto d1 = Dev.create({{"name", "temp-1"}, {"room", "lab"}});
+    auto d2 = Dev.create({{"name", "temp-2"}, {"room", "hall"}});
+    std::vector<Value> rows;
+    for (int i = 0; i < 10; i++) {
+        rows.push_back({{"device", d1.id()},
+                        {"value", 20 + i},
+                        {"at", "2026-11-17T10:0" + std::to_string(i) + ":00Z"},
+                        {"tags", Value::array({"t", i % 2 ? "odd" : "even"})}});
+        rows.push_back({{"device", d2.id()},
+                        {"value", 30 + i},
+                        {"at", "2026-11-18T10:0" + std::to_string(i) + ":00Z"},
+                        {"tags", Value::array({"t"})}});
+    }
+    Reading.insertMany(rows);
+
+    // string id + date string in $match work without ObjectId(...) / Date::parse(...)
+    auto stats = Reading.aggregate()
+                     .match({{"device", d1.id()}, {"at", {{"$gte", "2026-11-17"}}}})
+                     .group("device", {avg("value"), max("value"), min("value"), count()})
+                     .exec();
+    CHECK(stats.size() == 1);
+    CHECK(stats[0]["avgValue"].asDouble() == 24.5 && stats[0]["maxValue"].asInt() == 29);
+    CHECK(stats[0]["minValue"].asInt() == 20 && stats[0]["count"].asInt() == 10);
+    CHECK(stats[0]["_id"] == d1._id());
+
+    // all devices, sorted, into a struct
+    auto typed =
+        Reading.aggregate().group("device", {avg("value"), max("value"), count()}).sort("-avgValue").exec<DeviceStat>();
+    CHECK(typed.size() == 2 && typed[0].id == d2.id() && typed[0].avgValue == 34.5 && typed[0].count == 10);
+
+    // the same pipeline written by hand: $match is cast now too
+    auto raw = Reading.aggregate(Value::array({{{"$match", {{"device", d2.id()}}}}, {{"$count", "n"}}}));
+    CHECK(raw.size() == 1 && raw[0]["n"].asInt() == 10);
+
+    // lookup by model name + unwind + project
+    auto joined = Reading.aggregate()
+                      .match({{"value", {{"$gte", 38}}}})
+                      .lookup("AggDevice", "device", "_id", "dev")
+                      .unwind("dev")
+                      .project({{"_id", 0}, {"value", 1}, {"room", "$dev.room"}})
+                      .sort("value")
+                      .exec();
+    CHECK(joined.size() == 2 && joined[0]["room"].asString() == "hall" && joined[1]["value"].asInt() == 39);
+
+    // unwind array + group by the element
+    auto byTag = Reading.aggregate().unwind("tags").group("tags", {count()}).sort("-count _id").exec();
+    CHECK(byTag.size() == 3 && byTag[0]["_id"].asString() == "t" && byTag[0]["count"].asInt() == 20);
+
+    // whole collection, first(), count(), skip/limit
+    auto total = Reading.aggregate().group("", {sum("value"), count()}).first();
+    CHECK(total && (*total)["sumValue"].asInt() == 245 + 345 && (*total)["count"].asInt() == 20);
+    CHECK(Reading.aggregate().match({{"value", {{"$lt", 25}}}}).count().first().value()["count"].asInt() == 5);
+    CHECK(Reading.aggregate().sort("value").skip(18).limit(5).exec().size() == 2);
+    CHECK(!Reading.aggregate().match({{"value", 1000}}).first());
+    CHECK(Reading.aggregate().sample(3).exec().size() == 3);
+
+    // push / addToSet / first / last with sort
+    auto pushed = Reading.aggregate()
+                      .match({{"device", d1.id()}})
+                      .sort("at")
+                      .group("device", {first("value"), last("value"), push("value").as("all"), addToSet("tags")})
+                      .first()
+                      .value();
+    CHECK(pushed["firstValue"].asInt() == 20 && pushed["lastValue"].asInt() == 29 && pushed["all"].size() == 10);
+
+    // options + raw stage ($facet)
+    auto facet =
+        Reading.aggregate()
+            .stage({{"$facet",
+                     {{"low", Value::array({{{"$match", {{"value", {{"$lt", 30}}}}}}, {{"$count", "n"}}})},
+                      {"high", Value::array({{{"$match", {{"value", {{"$gte", 30}}}}}}, {{"$count", "n"}}})}}}})
+            .options({.allowDiskUse = true, .maxTimeMS = 5000})
+            .exec();
+    CHECK(facet.size() == 1 && facet[0]["low"].at(0)["n"].asInt() == 10 && facet[0]["high"].at(0)["n"].asInt() == 10);
+
+    // hooks see the builder's pipeline too
+    Schema hs({{"v", Int()}});
+    hs.pre("aggregate", [](QueryInfo &q) { q.filter.push_back(Value{{"$limit", 1}}); });
+    auto H = model("AggHooked", hs);
+    H.dropCollection();
+    H.insertMany({{{"v", 1}}, {{"v", 2}}, {{"v", 3}}});
+    CHECK(H.aggregate().sort("v").exec().size() == 1);
+    H.dropCollection();
+
+    // discriminators: the builder only sees its own type
+    auto Base = model("AggBase", Schema({{"n", Int()}}));
+    auto Kid = Base.discriminator("AggKid", Schema({{"extra", String()}}));
+    Base.dropCollection();
+    Base.create({{"n", 1}});
+    Kid.create({{"n", 2}, {"extra", "x"}});
+    CHECK(Kid.aggregate().group("", {sum("n")}).first().value()["sumN"].asInt() == 2);
+    CHECK(Base.aggregate().group("", {sum("n")}).first().value()["sumN"].asInt() == 3);
+    Base.dropCollection();
+
+    CHECK_THROWS(Reading.aggregate(Value::object()), Error);  // a pipeline must be an array
+    Dev.dropCollection();
+    Reading.dropCollection();
+}
+
 int main() {
     testValue();
     testSchemaOffline();
     testSchemaFeaturesOffline();
+    testAggregateBuilderOffline();
 
     const char *env = std::getenv("NEVLA_TEST_URI");
     std::string uri = env ? env : "mongodb://127.0.0.1:27017/?directConnection=true";
@@ -1082,6 +1255,7 @@ int main() {
     testPopulateFeatures();
     testStaticsHooksDocs();
     testModelExtras();
+    testAggregateBuilderDb();
     disconnect();
     CHECK(!connected());
 

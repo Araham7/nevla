@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(nevla VERSION 0.2.0 LANGUAGES CXX)
+project(nevla VERSION 0.3.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -39,7 +39,7 @@ if(NEVLA_BUILD_TESTS)
 endif()
 
 if(NEVLA_BUILD_EXAMPLES)
-  foreach(ex 01_quickstart 02_blog 03_iot 04_typed_struct 05_features)
+  foreach(ex 01_quickstart 02_blog 03_iot 04_typed_struct 05_features 06_iot_dashboard)
     add_executable(${ex} examples/${ex}.cc)
     target_link_libraries(${ex} PRIVATE nevla)
   endforeach()

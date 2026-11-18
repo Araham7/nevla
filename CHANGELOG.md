@@ -3,6 +3,25 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] - 2026-11-18
+
+### Added
+- **Aggregation builder**: `Model.aggregate()` returns a chainable `Aggregate` with `match`, `group`, `sort`,
+  `limit`, `skip`, `project`, `addFields`, `unwind`, `lookup` (model or collection name), `count`, `sample`,
+  `replaceRoot`, `stage` (raw), `options` (`allowDiskUse`, `maxTimeMS`, `collation`, `hint`), and
+  `exec()`, `exec<T>()` (into `NEVLA_STRUCT`), `first()`, `pipeline()`, `toJson()`.
+- Accumulator helpers: `count()`, `sum`, `avg`, `min`, `max`, `first`, `last`, `push`, `addToSet`,
+  `stdDevPop`, `accumulator(op, expr, name)`, with automatic output names (`avg("value")` → `avgValue`)
+  and `.as("name")`. Several group keys: `group("device room", ...)`.
+- **Automatic casting of `$match` in aggregation pipelines** (builder and hand-written pipelines) while the
+  documents still have the schema's shape. Mongoose does not do this.
+- Reads (`find`, `aggregate`) interrupted by the server with `QueryPlanKilled` / `CursorKilled` are retried
+  (up to 3 attempts; never for `$out` / `$merge` or inside a transaction).
+- Example `06_iot_dashboard.cc`: concurrent writers + live dashboard readers, verifies every aggregate.
+
+### Changed
+- `Model.aggregate(pipeline)` now requires an array (it used to treat anything else as an empty pipeline).
+
 ## [0.2.0] - 2026-11-18
 
 ### Added

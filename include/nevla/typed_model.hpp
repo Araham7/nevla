@@ -275,12 +275,12 @@ class TypedUpdate {
         return *this;
     }
     template <class E>
-    TypedUpdate &push(std::vector<E> T::*member, const E &item) {
+    TypedUpdate &push(std::vector<E> T::*member, const std::type_identity_t<E> &item) {  // "literal" ok
         update_["$push"][detail::memberName(member)] = toValue(item);
         return *this;
     }
     template <class E>
-    TypedUpdate &pull(std::vector<E> T::*member, const E &item) {
+    TypedUpdate &pull(std::vector<E> T::*member, const std::type_identity_t<E> &item) {  // "literal" ok
         update_["$pull"][detail::memberName(member)] = toValue(item);
         return *this;
     }

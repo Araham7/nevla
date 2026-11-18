@@ -1652,12 +1652,12 @@ static void testTypedModels() {
     auto r = Users.update(saved.id)
                  .set(&TUser::age, 22)
                  .inc(&TUser::score, 1.5)
-                 .push(&TUser::tags, std::string("pro"))
+                 .push(&TUser::tags, "pro")
                  .exec();
     CHECK(r.modifiedCount == 1);
     TUser now = *Users.findById(saved.id);
     CHECK(now.age == 22 && now.score == 9.0 && now.tags.size() == 3 && now.tags[2] == "pro");
-    Users.update(saved.id).pull(&TUser::tags, std::string("cpp")).set(&TUser::nick, std::string("ash")).exec();
+    Users.update(saved.id).pull(&TUser::tags, "cpp").set(&TUser::nick, "ash").exec();
     now = *Users.findById(saved.id);
     CHECK(now.tags.size() == 2 && now.nick == "ash");
     CHECK(Users.updateMany("age >= 30").set(&TUser::active, true).exec().matchedCount == 2);

@@ -1546,6 +1546,218 @@ static void testSlowAndStrict() {
     Strict.dropCollection();
 }
 
+/* ============================ v0.5: typed models, co_await ============================ */
+struct TAddress {
+    std::string city;
+    int pin = 0;
+};
+NEVLA_STRUCT(TAddress, city, pin)
+struct TPet {
+    std::string name, kind;
+};
+NEVLA_STRUCT(TPet, name, kind)
+struct TUser {
+    std::string id, name, email;
+    int age = 0;
+    double score = 0;
+    bool active = true;
+    std::vector<std::string> tags;
+    std::optional<std::string> nick;
+    TAddress address;
+    Date joined;
+    std::map<std::string, int> marks;
+    std::vector<TPet> pets;
+};
+NEVLA_STRUCT(TUser, id, name, email, age, score, active, tags, nick, address, joined, marks, pets)
+
+static void testTypedModels() {
+    section("typed models (member pointers)");
+    Schema gen = schemaOf<TUser>({.timestamps = true});
+    CHECK(!gen.field("id") && gen.field("name")->type == FieldType::String && gen.field("age")->type == FieldType::Int);
+    CHECK(gen.field("score")->type == FieldType::Number && gen.field("active")->type == FieldType::Boolean);
+    CHECK(gen.field("joined")->type == FieldType::Date && gen.field("marks")->type == FieldType::Map);
+    CHECK(gen.field("address")->type == FieldType::Object && gen.path("address.pin")->type == FieldType::Int);
+    CHECK(gen.field("pets")->type == FieldType::Array && gen.field("pets")->schema_ && gen.path("pets.0.kind"));
+    CHECK(gen.field("tags")->type == FieldType::Array && gen.field("nick")->type == FieldType::String);
+    CHECK(TypedModel<TUser>::path(&TUser::id) == "_id" && TypedModel<TUser>::path(&TUser::email) == "email");
+
+    // the generated schema + extra rules
+    Schema s = schemaOf<TUser>({.timestamps = true});
+    s.add("email", String().required().lowercase().unique());
+    s.add("age", Int().min(0).max(150));
+    TypedModel<TUser> Users("TUser", s);
+    Users.deleteMany(Value::object());
+    Users.model().createIndexes();
+
+    TUser a;
+    a.name = "Asha";
+    a.email = "ASHA@X.IN";
+    a.age = 21;
+    a.score = 7.5;
+    a.tags = {"cpp", "iot"};
+    a.address = {"Durgapur", 713209};
+    a.joined = *Date::parse("2026-01-02");
+    a.marks = {{"dsp", 90}, {"vlsi", 80}};
+    a.pets = {{"Tom", "cat"}};
+    TUser saved = Users.create(a);
+    CHECK(saved.id.size() == 24 && saved.email == "asha@x.in" && saved.address.city == "Durgapur");
+    CHECK(saved.marks.at("dsp") == 90 && saved.pets.size() == 1 && saved.pets[0].kind == "cat" && !saved.nick);
+
+    TUser b = a, c = a;
+    b.name = "Bo", b.email = "bo@x.in", b.age = 35, b.score = 9, b.tags = {"java"}, b.address = {"Kolkata", 700001};
+    b.nick = "bobby";
+    c.name = "Cy", c.email = "cy@x.in", c.age = 70, c.score = 4, c.active = false;
+    auto many = Users.insertMany({b, c});
+    CHECK(many.size() == 2 && many[0].id.size() == 24);
+
+    CHECK(Users.find().where(&TUser::age).gte(18).lt(60).count() == 2);  // both conditions kept
+    CHECK(Users.find().where(&TUser::address, &TAddress::city).equals("Kolkata").first()->name == "Bo");
+    CHECK(Users.find().where(&TUser::tags).contains("cpp").count() == 2);
+    CHECK(Users.find().where(&TUser::name).regex("^b", "i").count() == 1);
+    CHECK(Users.find().where(&TUser::nick).exists(true).count() == 3);  // nullopt is stored as null
+    CHECK(Users.find("nick == null").count() == 2);
+    CHECK(Users.find().where(&TUser::nick).equals("bobby").count() == 1);
+    CHECK(Users.find().where(&TUser::age).in({21, 70}).count() == 2);
+    CHECK(Users.find().where(&TUser::active).equals(false).count() == 1);
+    CHECK(Users.find().where("score > 5 && age < 60").count() == 2);  // formula + typed together
+    auto sorted = Users.find().sort(&TUser::active, -1).sort(&TUser::age, -1).exec();
+    CHECK(sorted.size() == 3 && sorted[0].name == "Bo" && sorted[2].name == "Cy");
+    CHECK(Users.find().sort(&TUser::score).limit(1).exec()[0].name == "Cy");
+    CHECK(Users.findOne({{"email", "cy@x.in"}})->age == 70);
+    CHECK(Users.findById(saved.id)->name == "Asha" && !Users.findById(ObjectId::generate()));
+
+    // typed updates
+    auto r = Users.update(saved.id)
+                 .set(&TUser::age, 22)
+                 .inc(&TUser::score, 1.5)
+                 .push(&TUser::tags, std::string("pro"))
+                 .exec();
+    CHECK(r.modifiedCount == 1);
+    TUser now = *Users.findById(saved.id);
+    CHECK(now.age == 22 && now.score == 9.0 && now.tags.size() == 3 && now.tags[2] == "pro");
+    Users.update(saved.id).pull(&TUser::tags, std::string("cpp")).set(&TUser::nick, std::string("ash")).exec();
+    now = *Users.findById(saved.id);
+    CHECK(now.tags.size() == 2 && now.nick == "ash");
+    CHECK(Users.updateMany("age >= 30").set(&TUser::active, true).exec().matchedCount == 2);
+    CHECK(Users.find().where(&TUser::active).equals(false).count() == 0);
+    Users.update(saved.id).unset(&TUser::nick).exec();
+    CHECK(!Users.findById(saved.id)->nick);
+
+    // save(): changed fields are validated and stored
+    now.address.city = "Asansol";
+    now.age = 23;
+    TUser after = Users.save(now);
+    CHECK(after.address.city == "Asansol" && after.age == 23 && Users.findById(saved.id)->age == 23);
+    now.age = 500;
+    CHECK_THROWS(Users.save(now), ValidationError);  // schema rules still apply
+    TUser fresh;
+    fresh.name = "New";
+    fresh.email = "new@x.in";
+    CHECK(Users.save(fresh).id.size() == 24);  // no id -> insert
+    TUser dupe = a;
+    CHECK_THROWS(Users.create(dupe), DuplicateKeyError);  // unique email
+    TUser noEmail;
+    noEmail.name = "x";
+    CHECK_THROWS(Users.create(noEmail), ValidationError);
+
+    CHECK(Users.deleteById(saved.id) && !Users.deleteById(saved.id));
+    CHECK(Users.count() == 3);
+    auto stats = Users.aggregate().group("", {avg("age")}).first();
+    CHECK(stats && (*stats)["avgAge"].asDouble() > 0);
+
+    // schema generated from the struct alone
+    TypedModel<TAddress> Places("TPlace");
+    Places.deleteMany(Value::object());
+    Places.create({"Durgapur", 713209});
+    CHECK(Places.find().where(&TAddress::pin).gt(700000).first()->city == "Durgapur");
+    Places.deleteMany(Value::object());
+    Users.deleteMany(Value::object());
+}
+
+static Task<int64_t> countAdultsTask(Model U) {
+    int64_t n = co_await U.find("age >= 18").countAsync();
+    co_return n;
+}
+
+// Note for GCC 13: build Values in variables before co_await (braced lists inside co_await crash GCC 13)
+static Task<std::string> asyncFlow(Model U, std::vector<std::thread::id> *threads) {
+    threads->push_back(std::this_thread::get_id());
+    Value newUser{{"name", "co"}, {"age", 40}};
+    auto d = co_await U.createAsync(newUser);
+    threads->push_back(std::this_thread::get_id());
+    auto found = co_await U.findById(d._id()).execAsync();
+    Value byId{{"_id", d._id()}}, setAge{{"age", 41}}, byName{{"name", "co2"}};
+    co_await U.updateOneAsync(byId, setAge);
+    auto rows = co_await U.find(byId).leanAsync();
+    auto agg = co_await U.aggregate().match(byId).execAsync();
+    found->set("name", "co2");
+    co_await found->saveAsync();
+    int64_t adults = co_await countAdultsTask(U);  // a Task inside a Task
+    auto one = co_await U.findOne(byName).leanAsync();
+    int64_t removed = co_await U.deleteOneAsync(byId);
+    int64_t seven = co_await asyncCall([] { return 7; });
+    co_return std::to_string(rows[0]["age"].asInt()) + "/" + std::to_string(agg.size()) + "/" + std::to_string(adults) +
+        "/" + (*one)["name"].asString() + "/" + std::to_string(removed) + "/" + std::to_string(seven);
+}
+
+static Task<void> failingFlow(Model U) {
+    Value bad{{"name", ""}};
+    co_await U.createAsync(bad);  // required name -> ValidationError
+}
+
+static Task<int> sumFlow(Model U, int rounds) {
+    int total = 0;
+    for (int i = 0; i < rounds; i++) {
+        Value doc{{"name", "bulk"}, {"age", i}};
+        co_await U.createAsync(doc);
+        total += static_cast<int>(co_await U.countDocumentsAsync(doc) > 0);
+    }
+    co_return total;
+}
+
+static void testAsync() {
+    section("co_await / Task / Async");
+    auto U = model("AsyncUser", Schema({{"name", String().required()}, {"age", Int()}}));
+    U.dropCollection();
+    U.create({{"name", "a"}, {"age", 20}});
+    U.create({{"name", "b"}, {"age", 10}});
+
+    CHECK(countAdultsTask(U).get() == 1);
+    std::vector<std::thread::id> threads;
+    std::string flow = asyncFlow(U, &threads).get();
+    CHECK(flow == "41/1/2/co2/1/7");
+    if (flow != "41/1/2/co2/1/7") std::cout << "  asyncFlow: " << flow << "\n";
+    CHECK(threads.size() == 2 && threads[0] != threads[1]);  // the work ran on a pool thread
+
+    try {
+        failingFlow(U).get();
+        CHECK(false);
+    } catch (const ValidationError &e) {
+        CHECK(e.errors.count("name"));
+    }
+    // Async::get() runs right here, without a coroutine
+    CHECK(U.find("age >= 0").countAsync().get() == 2);
+
+    // many coroutines from many threads at the same time
+    std::vector<std::thread> ts;
+    std::atomic<int> ok{0};
+    for (int t = 0; t < 6; t++) ts.emplace_back([&] { ok += sumFlow(U, 25).get(); });
+    for (auto &t : ts) t.join();
+    CHECK(ok == 150 && U.countDocuments({{"name", "bulk"}}) == 150);
+
+    // a typed query too
+    TypedModel<TAddress> P("AsyncPlace");
+    P.deleteMany(Value::object());
+    P.create({"Kolkata", 700001});
+    auto task = [](TypedModel<TAddress> &m) -> Task<size_t> {
+        auto rows = co_await m.find().where(&TAddress::city).equals("Kolkata").execAsync();
+        co_return rows.size();
+    };
+    CHECK(task(P).get() == 1);
+    P.deleteMany(Value::object());
+    U.dropCollection();
+}
+
 int main() {
     testValue();
     testSchemaOffline();
@@ -1578,6 +1790,8 @@ int main() {
     testAggregateBuilderDb();
     testV04Db();
     testSlowAndStrict();
+    testTypedModels();
+    testAsync();
     disconnect();
     CHECK(!connected());
 

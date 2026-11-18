@@ -10,9 +10,14 @@
      }
      int64_t n = countAdults().get();         // run + wait (outside any coroutine)
 
-   With Drogon:   drogon::Task<> handler(...) { auto users = co_await User.find().leanAsync(); ... }
-   The coroutine continues on a nevla pool thread; in Drogon use co_await drogon::switchThreadCoro(loop)
-   if you must be back on the event-loop thread.
+   Any coroutine type can co_await an Async<T> (await_suspend takes a plain std::coroutine_handle<>),
+   so it works inside drogon::Task<>, cppcoro, asio awaitables, or nevla::Task.
+
+   Where the coroutine continues: by default on the nevla pool thread that did the work. Install a
+   resumer to come back on the thread that awaited (an event loop):
+       nevla::setResumeOn([]() -> nevla::Resumer { ... });   // see below
+   With Drogon just #include <nevla/drogon.hpp> and call nevla::useDrogonLoop() once at startup:
+   every co_await then continues on the same Drogon IO loop that started it.
 
    Thread-local state travels with the job: nevla::TenantScope / ActorScope values are visible to it.
    A nevla::transaction() does NOT span *Async() calls (a transaction belongs to one thread).          */
@@ -46,6 +51,22 @@ void runAsync(std::function<void()> job);
 // Number of pool threads (default: max(4, hardware threads)). Call before the first *Async() call.
 void setAsyncThreads(unsigned n);
 
+/* Resume control. A Resumer takes "resume the coroutine" and runs it somewhere (e.g. queues it on an
+   event loop). The capture function is called on the AWAITING thread when a co_await suspends; it
+   returns the Resumer for that thread, or an empty one to continue on the pool thread.
+       nevla::setResumeOn([]() -> nevla::Resumer {
+           auto *loop = trantor::EventLoop::getEventLoopOfCurrentThread();
+           if (!loop) return {};                          // not on a loop: continue on the pool
+           return [loop](std::function<void()> f) { loop->queueInLoop(std::move(f)); };
+       });
+   Pass {} to go back to the default. Set it once at startup (it is not meant to change while
+   operations are in flight).                                                                       */
+using Resumer = std::function<void(std::function<void()>)>;
+void setResumeOn(std::function<Resumer()> capture);
+namespace detail {
+Resumer captureResumer();  // the Resumer for the current thread (empty = resume on the pool)
+}
+
 // An awaitable database operation. co_await it inside a coroutine, or .get() to run it here and now.
 template <class T>
 class [[nodiscard]] Async {
@@ -54,7 +75,8 @@ class [[nodiscard]] Async {
     bool await_ready() const noexcept { return false; }
     void await_suspend(std::coroutine_handle<> h) {
         auto ctx = detail::captureContext();
-        detail::runAsync([this, h, ctx] {
+        auto post = detail::captureResumer();
+        detail::runAsync([this, h, ctx, post = std::move(post)] {
             detail::restoreContext(ctx);
             try {
                 result_.emplace(fn_());
@@ -62,7 +84,8 @@ class [[nodiscard]] Async {
                 err_ = std::current_exception();
             }
             detail::restoreContext({});
-            h.resume();  // `this` may be gone after this line
+            if (post) post([h] { h.resume(); });  // back on the awaiting thread's loop
+            else h.resume();                       // `this` may be gone after this line
         });
     }
     T await_resume() {
@@ -84,7 +107,8 @@ class [[nodiscard]] Async<void> {
     bool await_ready() const noexcept { return false; }
     void await_suspend(std::coroutine_handle<> h) {
         auto ctx = detail::captureContext();
-        detail::runAsync([this, h, ctx] {
+        auto post = detail::captureResumer();
+        detail::runAsync([this, h, ctx, post = std::move(post)] {
             detail::restoreContext(ctx);
             try {
                 fn_();
@@ -92,7 +116,8 @@ class [[nodiscard]] Async<void> {
                 err_ = std::current_exception();
             }
             detail::restoreContext({});
-            h.resume();
+            if (post) post([h] { h.resume(); });
+            else h.resume();
         });
     }
     void await_resume() {

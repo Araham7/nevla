@@ -73,6 +73,25 @@ detail::Context &detail::context() { return tContext; }
 detail::Context detail::captureContext() { return tContext; }
 void detail::restoreContext(const Context &c) { tContext = c; }
 void detail::runAsync(std::function<void()> job) { pool().submit(std::move(job)); }
+
+namespace {
+std::mutex gResumeMu;
+std::shared_ptr<const std::function<Resumer()>> gResume;
+}  // namespace
+
+void setResumeOn(std::function<Resumer()> capture) {
+    std::lock_guard<std::mutex> lk(gResumeMu);
+    gResume = capture ? std::make_shared<const std::function<Resumer()>>(std::move(capture)) : nullptr;
+}
+
+Resumer detail::captureResumer() {
+    std::shared_ptr<const std::function<Resumer()>> f;
+    {
+        std::lock_guard<std::mutex> lk(gResumeMu);
+        f = gResume;
+    }
+    return f ? (*f)() : Resumer{};
+}
 void setAsyncThreads(unsigned n) { pool().setSize(n); }
 
 }  // namespace nevla

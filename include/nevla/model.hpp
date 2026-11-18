@@ -701,6 +701,7 @@ class Model {
     friend Model model(const std::string &, const Schema &, const std::string &);
     friend class BatchWriter;
     friend Model model(const std::string &);
+    friend std::vector<std::string> syncValidators(const std::string &, const std::string &);
     explicit Model(std::shared_ptr<ModelImpl> m) : m_(std::move(m)) {}
     std::shared_ptr<ModelImpl> m_;
 };
@@ -711,5 +712,9 @@ Model model(const std::string &name, const Schema &schema, const std::string &co
 Model model(const std::string &name);
 // All model names
 std::vector<std::string> modelNames();
+// syncValidator() on every model (skips time-series models and discriminator children, which share
+// their base model's collection).
+// Returns the names that were synced. Handy for a "db:sync" CLI step.
+std::vector<std::string> syncValidators(const std::string &level = "strict", const std::string &action = "error");
 
 }  // namespace nevla

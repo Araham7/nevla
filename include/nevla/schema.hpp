@@ -41,6 +41,12 @@ class ValidationError : public Error {
     ValidationError(const std::string &msg, std::map<std::string, std::string> errs,
                     std::map<std::string, std::string> k = {})
         : Error(msg), errors(std::move(errs)), kinds(std::move(k)) {}
+    // {"email": "Path `email` is required.", ...}: ready for a 400 response body
+    Value toJSON() const {
+        Value o = Value::object();
+        for (const auto &kv : errors) o[kv.first] = kv.second;
+        return o;
+    }
 };
 
 // A unique index was violated (MongoDB E11000)

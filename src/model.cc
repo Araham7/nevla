@@ -3147,6 +3147,8 @@ void Model::syncValidator(const std::string &level, const std::string &action) c
         throw Error("nevla: syncValidator(): level must be \"strict\", \"moderate\" or \"off\"");
     if (action != "error" && action != "warn")
         throw Error("nevla: syncValidator(): action must be \"error\" or \"warn\"");
+    if (!m_->discValue.empty())  // the child would replace the base model's validator for the whole collection
+        throw Error("nevla: syncValidator(): \"" + m_->name + "\" is a discriminator; call it on the base model");
     createCollection();
     auto c = currentConn();
     Value cmd = Value::object();
@@ -3691,6 +3693,18 @@ std::vector<std::string> modelNames() {
     std::vector<std::string> out;
     for (const auto &kv : gModels) out.push_back(kv.first);
     return out;
+}
+
+std::vector<std::string> syncValidators(const std::string &level, const std::string &action) {
+    std::vector<std::string> done;
+    for (const auto &name : modelNames()) {
+        Model m = model(name);
+        if (!m.schema().options.timeseries.timeField.empty()) continue;
+        if (m.m_->discValue.size()) continue;  // shares the base model's collection (and validator)
+        m.syncValidator(level, action);
+        done.push_back(name);
+    }
+    return done;
 }
 
 }  // namespace nevla

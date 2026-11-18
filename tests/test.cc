@@ -4,6 +4,9 @@
 #include <atomic>
 #include <chrono>
 #include <cstdlib>
+#include <functional>
+#include <deque>
+#include <condition_variable>
 #include <iostream>
 #include <mutex>
 #include <nevla/nevla.hpp>
@@ -1777,6 +1780,181 @@ static void testAsync() {
     U.dropCollection();
 }
 
+/* ---- co_await from a foreign coroutine type + resuming on the awaiting event loop ---- */
+namespace {
+// A tiny single-thread event loop (stands in for trantor::EventLoop / asio::io_context)
+class FakeLoop {
+  public:
+    FakeLoop() : th_([this] { run(); }) {}
+    ~FakeLoop() {
+        post({});  // empty job = stop
+        th_.join();
+    }
+    void post(std::function<void()> f) {
+        std::lock_guard<std::mutex> lk(mu_);  // notify under the lock: the loop may be destroyed right after
+        q_.push_back(std::move(f));
+        cv_.notify_one();
+    }
+    std::thread::id id() const { return th_.get_id(); }
+    static FakeLoop *current() { return cur_; }
+
+  private:
+    void run() {
+        cur_ = this;
+        for (;;) {
+            std::function<void()> f;
+            {
+                std::unique_lock<std::mutex> lk(mu_);
+                cv_.wait(lk, [&] { return !q_.empty(); });
+                f = std::move(q_.front());
+                q_.pop_front();
+            }
+            if (!f) return;
+            f();
+        }
+    }
+    static thread_local FakeLoop *cur_;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    std::deque<std::function<void()>> q_;
+    std::thread th_;
+};
+thread_local FakeLoop *FakeLoop::cur_ = nullptr;
+
+// A coroutine type that is NOT nevla::Task (like drogon::Task / an asio awaitable): eager, fire-and-forget
+struct Fire {
+    struct promise_type {
+        Fire get_return_object() { return {}; }
+        std::suspend_never initial_suspend() noexcept { return {}; }
+        std::suspend_never final_suspend() noexcept { return {}; }
+        void return_void() {}
+        void unhandled_exception() { std::terminate(); }
+    };
+};
+
+struct ResumeReport {
+    std::mutex mu;
+    std::condition_variable cv;
+    int done = 0, onLoop = 0, offLoop = 0, caught = 0;
+    int64_t count = -1;
+    void finish(bool loopThread) {
+        std::lock_guard<std::mutex> lk(mu);
+        (loopThread ? onLoop : offLoop)++;
+        done++;
+        cv.notify_all();
+    }
+    bool waitFor(int n) {
+        std::unique_lock<std::mutex> lk(mu);
+        return cv.wait_for(lk, std::chrono::seconds(30), [&] { return done >= n; });
+    }
+};
+
+Fire loopFlow(Model U, FakeLoop *loop, ResumeReport *r, bool fail) {
+    Value probe = obj("name", "resume", "age", 5);  // obj(): no braced list (GCC 13)
+    if (fail) {
+        try {
+            co_await U.createAsync(obj("name", ""));  // required -> ValidationError
+        } catch (const ValidationError &) {
+            std::lock_guard<std::mutex> lk(r->mu);
+            r->caught++;
+        }
+    } else {
+        co_await U.createAsync(probe);
+        int64_t n = co_await U.find(obj("age", obj("$gte", 5))).countAsync();
+        std::lock_guard<std::mutex> lk(r->mu);
+        r->count = std::max(r->count, n);
+    }
+    r->finish(std::this_thread::get_id() == loop->id());
+}
+}  // namespace
+
+static void testResumeAndHelpers() {
+    section("co_await from any coroutine type + resume on the awaiting loop");
+    auto U = model("ResumeUser", Schema({{"name", String().required()}, {"age", Int()}}));
+    U.dropCollection();
+
+    // 1) no resumer installed: a foreign coroutine works, continues on the pool (not the loop)
+    {
+        FakeLoop loop;
+        ResumeReport r;
+        loop.post([&] { loopFlow(U, &loop, &r, false); });
+        CHECK(r.waitFor(1));
+        CHECK(r.offLoop == 1 && r.onLoop == 0 && r.count == 1);
+    }
+
+    // 2) resumer installed: every co_await comes back to the loop that awaited
+    nevla::setResumeOn([]() -> Resumer {
+        FakeLoop *l = FakeLoop::current();
+        if (!l) return {};
+        return [l](std::function<void()> f) { l->post(std::move(f)); };
+    });
+    {
+        FakeLoop loopA, loopB;
+        ResumeReport ra, rb;
+        const int N = 100;
+        for (int i = 0; i < N; i++) {
+            loopA.post([&, i] { loopFlow(U, &loopA, &ra, i % 10 == 0); });
+            loopB.post([&, i] { loopFlow(U, &loopB, &rb, i % 10 == 0); });
+        }
+        CHECK(ra.waitFor(N) && rb.waitFor(N));
+        CHECK(ra.onLoop == N && ra.offLoop == 0);  // also after an exception
+        CHECK(rb.onLoop == N && rb.offLoop == 0);
+        CHECK(ra.caught == 10 && rb.caught == 10);
+        CHECK(U.countDocuments(obj("name", "resume")) == 1 + 2 * 90);
+    }
+    // not on a loop (plain thread): resumer returns {} -> nevla::Task still works
+    CHECK(U.find("age >= 5").countAsync().get() == 181);
+    CHECK(countAdultsTask(U).get() == 0);
+    nevla::setResumeOn({});  // back to default
+    {
+        FakeLoop loop;
+        ResumeReport r;
+        loop.post([&] { loopFlow(U, &loop, &r, false); });
+        CHECK(r.waitFor(1) && r.offLoop == 1);
+    }
+
+    section("obj() / arr() / ValidationError::toJSON / syncValidators");
+    CHECK(obj("a", 1, "b", obj("c", "x")) == (Value{{"a", 1}, {"b", {{"c", "x"}}}}));
+    CHECK(arr(1, "two", 3.5) == Value::array({1, "two", 3.5}));
+    CHECK(arr().isArray() && arr().empty() && obj().isObject() && obj().empty());
+    CHECK(obj("list", arr(1, 2))["list"].size() == 2);
+    std::string key = "k";
+    CHECK(obj(key, true)["k"].asBool());
+    try {
+        U.create(obj("age", "notanumber"));
+        CHECK(false);
+    } catch (const ValidationError &e) {
+        Value j = e.toJSON();
+        CHECK(j.isObject() && j.contains("name") && j.contains("age"));
+        CHECK(j["name"].asString().find("required") != std::string::npos);
+    }
+    {
+        auto names = syncValidators();
+        bool has = false, ts = false;
+        for (auto &n : names) {
+            has |= n == "ResumeUser";
+            ts |= !model(n).schema().options.timeseries.timeField.empty();
+        }
+        CHECK(has && !ts);
+        CHECK(U.collectionInfo()["options"]["validator"]["$jsonSchema"]["required"] == Value::array({"name", "_id"}));
+    }
+    {  // discriminators: the base owns the validator, children are skipped / refused
+        auto Ev = model("ResumeEvent", Schema({{"at", Int().required()}}));
+        auto Click = Ev.discriminator("ResumeClick", Schema({{"button", String().required()}}));
+        Ev.dropCollection();
+        CHECK_THROWS(Click.syncValidator(), Error);
+        auto names = syncValidators();
+        bool base = false, child = false;
+        for (auto &n : names) base |= n == "ResumeEvent", child |= n == "ResumeClick";
+        CHECK(base && !child);
+        Ev.create(obj("at", 1));                       // a base doc passes the collection validator
+        Click.create(obj("at", 2, "button", "left"));  // and so does a child doc
+        CHECK(Ev.countDocuments() == 2);
+        Ev.dropCollection();
+    }
+    U.dropCollection();
+}
+
 /* ============================ v0.5: time-series, batch writer, fromQuery, schema export ============================
  */
 static void testTimeSeries() {
@@ -2853,6 +3031,7 @@ int main() {
     if (!gMemory) run("testSlowAndStrict", testSlowAndStrict);  // uses $where / $function to be slow
     run("testTypedModels", testTypedModels);
     run("testAsync", testAsync);
+    run("testResumeAndHelpers", testResumeAndHelpers);
     run("testTimeSeries", testTimeSeries);
     run("testBatchWriter", testBatchWriter);
     run("testFromQuery", testFromQuery);

@@ -243,4 +243,30 @@ T Value::as() const {
     return out;
 }
 
+/* obj("name", "Ravi", "age", 30)  ==  Value{{"name", "Ravi"}, {"age", 30}}
+   arr(1, 2, 3)                     ==  Value::array({1, 2, 3})
+   Same result as braces, but no braced list: use these inside co_await on GCC 13, which crashes
+   (internal compiler error) on {{...}} lists in a co_await expression. Any GCC 14+/Clang is fine with braces. */
+namespace detail {
+inline void objPut(Value &) {}
+template <class K, class V, class... R>
+void objPut(Value &o, K &&k, V &&v, R &&...rest) {
+    o[std::string(std::forward<K>(k))] = Value(std::forward<V>(v));
+    objPut(o, std::forward<R>(rest)...);
+}
+}  // namespace detail
+template <class... A>
+Value obj(A &&...kv) {
+    static_assert(sizeof...(A) % 2 == 0, "nevla::obj needs key, value pairs");
+    Value o = Value::object();
+    detail::objPut(o, std::forward<A>(kv)...);
+    return o;
+}
+template <class... A>
+Value arr(A &&...items) {
+    Value a = Value::array();
+    (a.push_back(Value(std::forward<A>(items))), ...);
+    return a;
+}
+
 }  // namespace nevla

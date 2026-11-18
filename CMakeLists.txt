@@ -23,13 +23,14 @@ else()
   set(NEVLA_MONGOCXX mongo::mongocxx_static)
 endif()
 
-add_library(nevla src/value.cc src/schema.cc src/model.cc src/formula.cc src/async.cc)
+add_library(nevla src/value.cc src/schema.cc src/model.cc src/formula.cc src/async.cc src/plugins.cc src/crypto.cc)
 add_library(nevla::nevla ALIAS nevla)
 target_include_directories(nevla PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
 find_package(Threads REQUIRED)
-target_link_libraries(nevla PUBLIC ${NEVLA_MONGOCXX} Threads::Threads)
+find_package(OpenSSL REQUIRED)
+target_link_libraries(nevla PUBLIC ${NEVLA_MONGOCXX} Threads::Threads PRIVATE OpenSSL::Crypto)
 target_compile_options(nevla PRIVATE -Wall -Wextra)
 
 if(NEVLA_BUILD_TESTS)
@@ -61,7 +62,7 @@ install(TARGETS nevla EXPORT nevlaTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LI
 install(DIRECTORY include/nevla DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(EXPORT nevlaTargets NAMESPACE nevla:: DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/nevla)
 file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/nevlaConfig.cmake
-"include(CMakeFindDependencyMacro)\nfind_dependency(mongocxx)\nfind_dependency(Threads)\ninclude(\${CMAKE_CURRENT_LIST_DIR}/nevlaTargets.cmake)\n")
+"include(CMakeFindDependencyMacro)\nfind_dependency(mongocxx)\nfind_dependency(Threads)\nfind_dependency(OpenSSL)\ninclude(\${CMAKE_CURRENT_LIST_DIR}/nevlaTargets.cmake)\n")
 include(CMakePackageConfigHelpers)
 write_basic_package_version_file(${CMAKE_CURRENT_BINARY_DIR}/nevlaConfigVersion.cmake
   VERSION ${PROJECT_VERSION} COMPATIBILITY SameMinorVersion)

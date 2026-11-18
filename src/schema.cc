@@ -126,6 +126,13 @@ Field &Field::ref(std::string modelName) {
     return *this;
 }
 
+Field &Field::encrypted(bool deterministic) {
+    if (type != FieldType::String) throw Error("nevla: encrypted() works on String() fields only");
+    encrypted_ = true;
+    deterministic_ = deterministic;
+    return *this;
+}
+
 static Field make(FieldType t) {
     Field f;
     f.type = t;

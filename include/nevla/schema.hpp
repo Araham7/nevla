@@ -97,6 +97,10 @@ struct Field {
     Field &get(std::function<Value(const Value &)> fn);  // getter: transform on doc.get() / toJSON({getters})
     Field &alias(std::string name);                      // doc.get("n") / doc.set("n", v) for field "name"
     Field &ref(std::string modelName);                   // for populate()
+    // Stored AES-256-GCM encrypted (String fields; needs nevla::setEncryptionKey). deterministic = true:
+    // the same text always encrypts the same way, so equality filters work ({{"token", t}}) but equal values
+    // can be recognised; false (default) is safer but the field cannot be filtered on.
+    Field &encrypted(bool deterministic = false);
 
     /* ---- data (readable) ---- */
     bool required_ = false;
@@ -119,6 +123,7 @@ struct Field {
     std::function<Value(const Value &)> setter_, getter_;
     std::string alias_;
     std::string ref_;
+    bool encrypted_ = false, deterministic_ = false;
     std::shared_ptr<Field> of_;       // element type of Array / value type of Map
     std::shared_ptr<Schema> schema_;  // schema of Object / Array-of-sub-documents
 };

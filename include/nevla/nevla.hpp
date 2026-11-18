@@ -3,6 +3,7 @@
 #include "async.hpp"
 #include "formula.hpp"
 #include "model.hpp"
+#include "plugins.hpp"
 #include "schema.hpp"
 #include "typed.hpp"
 #include "typed_model.hpp"

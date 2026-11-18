@@ -39,6 +39,7 @@
 #include <thread>
 
 #include "bson.hpp"
+#include "nevla/plugins.hpp"
 
 using bsoncxx::builder::basic::kvp;
 using bsoncxx::builder::basic::make_document;
@@ -429,9 +430,91 @@ bool isOperatorObject(const Value &v) {
 
 Value castFilter(const Schema &s, const Value &filter, const std::string *strictModel = nullptr);
 
+/* ---------------- field encryption ---------------- */
+bool hasEncrypted(const Schema &s) {
+    for (const auto &kv : s.fields()) {
+        const Field &f = kv.second;
+        if (f.encrypted_ || (f.of_ && f.of_->encrypted_)) return true;
+        if (f.schema_ && hasEncrypted(*f.schema_)) return true;
+    }
+    return false;
+}
+
+void encryptObject(const Schema &s, Value &obj);
+// v is a value of field f (or one element of it when f is an array and v is not)
+void encryptField(const Field &f, Value &v) {
+    if (v.isNull()) return;
+    if (f.encrypted_) {
+        if (v.isString()) v = detail::encryptText(v.asString(), f.deterministic_);
+    } else if (f.type == FieldType::Object && f.schema_) {
+        if (v.isObject()) encryptObject(*f.schema_, v);
+    } else if (f.type == FieldType::Array) {
+        auto one = [&](Value &e) {
+            if (f.schema_ && e.isObject())
+                encryptObject(*f.schema_, e);
+            else if (f.of_ && f.of_->encrypted_ && e.isString())
+                e = detail::encryptText(e.asString(), f.of_->deterministic_);
+        };
+        if (v.isArray()) {
+            for (auto &e : v.elements()) one(e);
+        } else if (v.isObject() && v.contains("$each")) {
+            for (auto &e : v["$each"].elements()) one(e);
+        } else {
+            one(v);
+        }
+    }
+}
+void encryptObject(const Schema &s, Value &obj) {
+    for (auto &kv : obj.items())
+        if (const Field *f = s.field(kv.first)) encryptField(*f, kv.second);
+}
+// The value stored at a dotted path ("address", "items.0", "token")
+void encryptAtPath(const Schema &s, const std::string &path, Value &v) {
+    if (!hasEncrypted(s)) return;
+    bool mixed = false;
+    const Field *f = s.path(path, &mixed);
+    if (f && !mixed) {
+        encryptField(*f, v);
+    } else if (auto dot = path.rfind('.'); dot != std::string::npos) {  // "items.0" = a whole sub-document
+        const Field *parent = s.path(path.substr(0, dot));
+        if (parent && parent->type == FieldType::Array && parent->schema_ && v.isObject())
+            encryptObject(*parent->schema_, v);
+    }
+}
+
+// Whole document about to be stored
+void encryptDoc(const Schema &s, Value &doc) {
+    if (hasEncrypted(s)) encryptObject(s, doc);
+}
+// Every "nvenc:" text in a result -> plain text (works for lookups / aggregations too)
+void decryptAll(Value &v) {
+    if (!detail::hasEncryptionKey()) return;
+    if (v.isString()) {
+        if (detail::isEncryptedText(v.asString())) v = detail::decryptText(v.asString());
+    } else if (v.isArray()) {
+        for (auto &e : v.elements()) decryptAll(e);
+    } else if (v.isObject()) {
+        for (auto &kv : v.items()) decryptAll(kv.second);
+    }
+}
+void decryptAll(std::vector<Value> &rows) {
+    if (!detail::hasEncryptionKey()) return;
+    for (auto &r : rows) decryptAll(r);
+}
+
 // One filter value in the field's type (for an array field a single element also matches)
 Value castScalar(const Schema &s, const Field &f, const Value &v, const std::string &path) {
     if (v.isNull()) return v;
+    const Field *enc = f.encrypted_                                                 ? &f
+                       : (f.type == FieldType::Array && f.of_ && f.of_->encrypted_) ? f.of_.get()
+                                                                                    : nullptr;
+    if (enc) {
+        if (!enc->deterministic_)
+            throw Error("nevla: \"" + path +
+                        "\" is encrypted and cannot be filtered on (use encrypted(true) for equality lookups)");
+        Value c = detail::castValue(*enc, v, path);
+        return c.isString() ? Value(detail::encryptText(c.asString(), true)) : c;
+    }
     if (path == "_id" && !s.hasOwnId())
         return v.isString() && ObjectId::isValid(v.asString()) ? Value(ObjectId(v.asString())) : v;
     if (f.type == FieldType::Array && !v.isArray()) {
@@ -452,6 +535,8 @@ Value castOperand(const Schema &s, const Field &f, const Value &v, const std::st
             for (const auto &e : m.second.elements()) arr.push_back(castScalar(s, f, e, path));
             out[op] = std::move(arr);
         } else if (op == "$eq" || op == "$ne" || op == "$gt" || op == "$gte" || op == "$lt" || op == "$lte") {
+            if ((f.encrypted_ || (f.of_ && f.of_->encrypted_)) && op != "$eq" && op != "$ne")
+                throw Error("nevla: \"" + path + "\" is encrypted: only equality filters work on it");
             out[op] = castScalar(s, f, m.second, path);
         } else if (op == "$not") {
             out[op] = castOperand(s, f, m.second, path);
@@ -610,7 +695,11 @@ Value castUpdate(ModelImpl &m, const Value &update, bool upsert, bool runValidat
                 continue;
             }
             if (f->immutable_ && name != "$setOnInsert") {
-                if (upsert && setLike) moveToInsert[path] = detail::castValue(*f, kv.second, path);
+                if (upsert && setLike) {
+                    Value v = detail::castValue(*f, kv.second, path);
+                    encryptField(*f, v);
+                    moveToInsert[path] = std::move(v);
+                }
                 continue;  // immutable: never changed by an update
             }
             Value v = kv.second;
@@ -648,6 +737,7 @@ Value castUpdate(ModelImpl &m, const Value &update, bool upsert, bool runValidat
                                                            : detail::formatMessage(f->requiredMessage_, path, nullptr);
                 kinds[path] = "required";
             }
+            if (setLike || pushLike) encryptField(*f, v);  // after validation (validators see plain text)
             out[path] = std::move(v);
         }
         op.second = std::move(out);
@@ -946,6 +1036,7 @@ std::vector<Value> runFind(const std::shared_ptr<ModelImpl> &m, const detail::Qu
             for (auto &&doc : cursor) out.push_back(fromBson(doc));
         });
     });
+    decryptAll(out);
     if (!spec.populate.empty() && !out.empty()) {
         std::vector<Value *> ptrs;
         for (auto &v : out) ptrs.push_back(&v);
@@ -1049,6 +1140,7 @@ int64_t runCount(const std::shared_ptr<ModelImpl> &m, const detail::QuerySpec &s
 
 std::vector<Value> runDistinct(const std::shared_ptr<ModelImpl> &m, const std::string &field, const Value &filterIn) {
     Value filter = prepareFilter(*m, filterIn);
+    runQueryHooks(*m, "distinct", filter, nullptr);
     std::string path = m->schema.resolveAlias(field);
     std::vector<Value> out;
     guard([&] {
@@ -1060,6 +1152,7 @@ std::vector<Value> runDistinct(const std::shared_ptr<ModelImpl> &m, const std::s
             for (const auto &e : row["values"].elements()) out.push_back(e);
         }
     });
+    decryptAll(out);
     return out;
 }
 
@@ -1082,6 +1175,7 @@ Value castReplacement(ModelImpl &m, const Value &replacement, bool runValidators
         if (!doc.contains(opt.createdAt)) doc[opt.createdAt] = now;
     }
     if (!m.discKey.empty()) doc[m.discKey] = m.discValue;
+    encryptDoc(m.schema, doc);
     return doc;
 }
 
@@ -1411,6 +1505,7 @@ Document &Document::save() {
         prepareInsert(*m_, data_);
         Value stored = data_;
         for (const auto &p : populated_) depopulatePath(m_->schema, stored, p);
+        encryptDoc(m_->schema, stored);  // the Document keeps the plain text
         guard([&] {
             Op o = open(*m_);
             OpTrace nv_trace(m_->collection, "insertOne", stored);
@@ -1437,6 +1532,7 @@ Document &Document::save() {
                         depopulatePath(m_->schema, wrap, "x" + pp.substr(p.size()));
                         copy = wrap["x"];
                     }
+                encryptAtPath(m_->schema, p, copy);
                 set[p] = std::move(copy);
                 const Field *f = m_->schema.path(p);
                 arrayChanged |= f && f->type == FieldType::Array;
@@ -1619,6 +1715,7 @@ std::optional<Value> Cursor::nextLean() {
         I.done = true;
         return std::nullopt;
     }
+    decryptAll(*v);
     if (!I.populate.empty()) {
         std::vector<Value *> ptrs{&*v};
         for (const auto &p : I.populate) populateValues(I.m, ptrs, p);
@@ -1685,7 +1782,9 @@ std::optional<Value> ChangeStream::next() {
         else
             ++(*I.it);
         if (*I.it == I.stream->end()) return std::nullopt;
-        return fromBson(**I.it);
+        Value ev = fromBson(**I.it);
+        decryptAll(ev);
+        return ev;
     });
 }
 
@@ -1727,7 +1826,9 @@ std::vector<Document> Model::insertMany(const std::vector<Value> &objects, Inser
         Document d = (*this)(o);
         d.validate();
         prepareInsert(*m_, d.data_);
-        raw.push_back(toBson(d.data_));
+        Value stored = d.data_;
+        encryptDoc(m_->schema, stored);
+        raw.push_back(toBson(stored));
         docs.push_back(std::move(d));
     }
     mongocxx::options::insert opts;
@@ -1804,7 +1905,9 @@ std::optional<Document> Model::findOneAndUpdate(const Value &filterIn, const Val
         OpTrace nv_trace(m_->collection, "findOneAndUpdate", Value{{"filter", filter}, {"update", update}});
         auto r = NV(o, find_one_and_update, toBson(filter), toBson(update), opts);
         if (!r) return std::nullopt;
-        return fromBson(r->view());
+        Value v = fromBson(r->view());
+        decryptAll(v);
+        return v;
     });
     if (hasPostHooks(*m_, "findOneAndUpdate")) {
         Value result = found ? *found : Value();
@@ -1836,7 +1939,9 @@ std::optional<Document> Model::findOneAndReplace(const Value &filterIn, const Va
         OpTrace nv_trace(m_->collection, "findOneAndReplace", Value{{"filter", filter}, {"replacement", doc}});
         auto r = NV(o, find_one_and_replace, toBson(filter), toBson(doc), opts);
         if (!r) return std::nullopt;
-        return fromBson(r->view());
+        Value v = fromBson(r->view());
+        decryptAll(v);
+        return v;
     });
     if (hasPostHooks(*m_, "findOneAndReplace")) {
         Value result = found ? *found : Value();
@@ -1855,7 +1960,9 @@ std::optional<Document> Model::findOneAndDelete(const Value &filterIn) const {
         OpTrace nv_trace(m_->collection, "findOneAndDelete", Value{{"filter", filter}});
         auto r = NV(o, find_one_and_delete, toBson(filter));
         if (!r) return std::nullopt;
-        return fromBson(r->view());
+        Value v = fromBson(r->view());
+        decryptAll(v);
+        return v;
     });
     if (hasPostHooks(*m_, "findOneAndDelete")) {
         Value result = found ? *found : Value();
@@ -1891,17 +1998,25 @@ BulkWriteResult Model::bulkWrite(const std::vector<Value> &operations, bool orde
             Document d = (*this)(arg["document"]);
             d.validate();
             prepareInsert(*m_, d.data_);
-            ops.push_back({kind, toBson(d.data_), toBson(Value::object()), false});
+            Value stored = d.data_;
+            encryptDoc(m_->schema, stored);
+            ops.push_back({kind, toBson(stored), toBson(Value::object()), false});
         } else if (kind == "updateOne" || kind == "updateMany") {
             Value filter = filterOf();
-            Value update = castUpdate(*m_, arg["update"], upsert, arg["runValidators"].asBool(), filter);
+            Value raw = arg["update"];
+            runQueryHooks(*m_, kind, filter, &raw);  // same middleware as updateOne() (tenant, soft delete ...)
+            Value update = castUpdate(*m_, raw, upsert, arg["runValidators"].asBool(), filter);
             if (update.empty()) continue;
             ops.push_back({kind, toBson(filter), toBson(update), upsert});
         } else if (kind == "replaceOne") {
             Value filter = filterOf();
-            ops.push_back({kind, toBson(filter), toBson(castReplacement(*m_, arg["replacement"], false)), upsert});
+            Value repl = arg["replacement"];
+            runQueryHooks(*m_, kind, filter, &repl);
+            ops.push_back({kind, toBson(filter), toBson(castReplacement(*m_, repl, false)), upsert});
         } else if (kind == "deleteOne" || kind == "deleteMany") {
-            ops.push_back({kind, toBson(filterOf()), toBson(Value::object()), false});
+            Value filter = filterOf();
+            runQueryHooks(*m_, kind, filter, nullptr);
+            ops.push_back({kind, toBson(filter), toBson(Value::object()), false});
         } else {
             throw Error("nevla: bulkWrite(): unknown operation \"" + kind + "\"");
         }
@@ -2029,6 +2144,7 @@ std::vector<Value> runAggregate(const std::shared_ptr<ModelImpl> &m, Value stage
         else
             retryRead(run);
     });
+    decryptAll(out);
     if (hasPostHooks(*m, "aggregate")) {
         Value result = Value::array();
         for (auto &v : out) result.push_back(std::move(v));
@@ -3016,6 +3132,7 @@ void BatchWriter::add(const Value &doc) {
     d.validate();  // bad documents fail here, in the caller's thread
     prepareInsert(*impl_->m, d.data_);
     Value ready = std::move(d.data_);
+    encryptDoc(impl_->m->schema, ready);
     std::unique_lock<std::mutex> lk(impl_->mu);
     impl_->cv.wait(lk, [&] { return impl_->queue.size() < impl_->o.maxQueue || impl_->stop; });
     impl_->queue.emplace_back(std::move(ready), std::chrono::steady_clock::now());

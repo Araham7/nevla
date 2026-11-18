@@ -136,6 +136,14 @@ Field Array(const Schema &schema);   // Array(Schema{...}) = list of sub-documen
 Field Object(const Schema &schema);  // nested object (single sub-document)
 Field Map(Field of);                 // object with any keys, every value cast to `of`:  Map(Number())
 
+// MongoDB time-series collection (MongoDB 5.0+): far less storage and fast time-range queries for sensor data
+struct TimeSeriesOptions {
+    std::string timeField;           // required: the DateTime field, e.g. "at"
+    std::string metaField;           // optional: what the measurement belongs to, e.g. "device"
+    std::string granularity;         // optional: "seconds" | "minutes" | "hours"
+    int64_t expireAfterSeconds = 0;  // optional: delete measurements older than this (0 = keep)
+};
+
 struct SchemaOptions {
     bool timestamps = false;         // createdAt / updatedAt automatically
     std::string collection;          // empty = from the model name ("User" -> "users")
@@ -148,6 +156,8 @@ struct SchemaOptions {
     std::string updatedAt = "updatedAt";
     bool optimisticConcurrency = false;  // save() fails with VersionError if the doc changed in the DB meanwhile
     bool getters = false;                // toJSON() applies field getters
+    bool strictQuery = false;            // a filter path that is not in the schema throws (typo protection)
+    TimeSeriesOptions timeseries;        // set timeField to make the collection a time-series collection
 };
 
 // What query middleware receives (may change filter / update)

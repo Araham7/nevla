@@ -48,6 +48,18 @@ void setDebug(std::function<void(const std::string &collection, const std::strin
 // Default: print to stderr. Model::createIndexes() throws instead.
 void onIndexError(std::function<void(const std::string &model, const std::string &message)> fn);
 
+// Slow query log: every operation that takes >= ms is reported (stderr by default) with an index suggestion
+struct SlowQuery {
+    std::string collection, op;
+    int64_t ms = 0;
+    Value args;              // filter / update / pipeline ...
+    std::string suggestion;  // e.g. "consider an index {device: 1, at: -1}" (equality, sort, range order)
+};
+void setSlowQueryThreshold(int64_t ms, std::function<void(const SlowQuery &)> fn = nullptr);  // 0 = off
+
+// strictQuery for every model: a filter path that is not in the schema throws (Mongoose silently ignores it)
+void setStrictQuery(bool on);
+
 /* ---------------- Results / options ---------------- */
 struct UpdateOptions {
     bool upsert = false;

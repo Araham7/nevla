@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstdlib>
 #include <iostream>
+#include <mutex>
 #include <nevla/nevla.hpp>
 #include <thread>
 
@@ -1464,6 +1465,87 @@ static void testV04Db() {
     for (auto M : {Company, Author, Tag, Post}) M.dropCollection();
 }
 
+/* ============================ v0.5: slow query log, strictQuery ============================ */
+static void testSlowAndStrict() {
+    section("slow query log + strictQuery");
+    auto S = model("SlowThing", Schema({{"device", String()},
+                                        {"at", DateTime()},
+                                        {"n", Int().alias("count")},
+                                        {"addr", Object(Schema({{"city", String()}}))},
+                                        {"meta", Mixed()}},
+                                       {.timestamps = true}));
+    S.dropCollection();
+    S.create({{"device", "a"}, {"at", Date::now()}, {"n", 1}});
+
+    std::vector<SlowQuery> slow;
+    std::mutex mu;
+    setSlowQueryThreshold(15, [&](const SlowQuery &q) {
+        std::lock_guard<std::mutex> lk(mu);
+        slow.push_back(q);
+    });
+    S.countDocuments();  // fast: not reported
+    // $where + sleep makes the server take ~40 ms
+    auto rows =
+        S.find({{"device", "a"}, {"at", {{"$gte", "2020-01-01"}}}, {"$where", "sleep(40) || true"}}).sort("-at").lean();
+    CHECK(rows.size() == 1);
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        CHECK(slow.size() == 1);
+        if (!slow.empty()) {
+            CHECK(slow[0].collection == "slowthings" && slow[0].op == "find" && slow[0].ms >= 15);
+            CHECK(slow[0].suggestion == "consider an index {device: 1, at: -1}");
+            CHECK(slow[0].args["filter"]["device"].asString() == "a");
+        }
+    }
+    Value sleepFn{
+        {"$function",
+         Value{{"body", "function() { sleep(40); return true; }"}, {"args", Value::array()}, {"lang", "js"}}}};
+    S.aggregate().match({{"device", "a"}, {"$expr", sleepFn}}).exec();
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        CHECK(slow.size() == 2 && slow.back().op == "aggregate" &&
+              slow.back().suggestion == "consider an index {device: 1}");
+    }
+    setSlowQueryThreshold(0);
+    S.find({{"$where", "sleep(40) || true"}}).lean();
+    CHECK(slow.size() == 2);  // off again
+
+    // strictQuery
+    CHECK(S.find({{"devise", "a"}}).count() == 0);  // default: unknown path silently matches nothing (like Mongoose)
+    auto Strict = model("StrictThing", Schema({{"email", String()},
+                                               {"n", Int().alias("count")},
+                                               {"addr", Object(Schema({{"city", String()}}))},
+                                               {"meta", Mixed()}},
+                                              {.timestamps = true, .strictQuery = true}));
+    Strict.dropCollection();
+    Strict.create({{"email", "a@b.c"}, {"n", 2}, {"addr", {{"city", "Durgapur"}}}});
+    try {
+        Strict.find({{"emial", "a@b.c"}}).count();
+        CHECK(false);
+    } catch (const Error &e) {
+        std::string w = e.what();
+        CHECK(w.find("unknown path \"emial\"") != std::string::npos &&
+              w.find("Did you mean \"email\"?") != std::string::npos);
+    }
+    CHECK_THROWS(Strict.countDocuments("addr.cty == 'Durgapur'"), Error);
+    CHECK_THROWS(Strict.updateMany({{"$or", Value::array({{{"emal", 1}}})}}, {{"n", 3}}), Error);  // nested in $or too
+    CHECK_THROWS(Strict.deleteMany({{"zzz", 1}}), Error);
+    // known paths, aliases, nested, Mixed sub-paths, timestamps, _id, __v and operators are fine
+    CHECK(Strict.countDocuments({{"email", "a@b.c"},
+                                 {"count", 2},
+                                 {"addr.city", "Durgapur"},
+                                 {"meta.any.thing", {{"$exists", false}}},
+                                 {"createdAt", {{"$exists", true}}},
+                                 {"__v", 0},
+                                 {"$comment", "x"}}) == 1);
+    CHECK(Strict.findById(ObjectId::generate()).lean() == std::nullopt);
+    setStrictQuery(true);  // global switch
+    CHECK_THROWS(S.find({{"devise", "a"}}).count(), Error);
+    setStrictQuery(false);
+    S.dropCollection();
+    Strict.dropCollection();
+}
+
 int main() {
     testValue();
     testSchemaOffline();
@@ -1495,6 +1577,7 @@ int main() {
     testModelExtras();
     testAggregateBuilderDb();
     testV04Db();
+    testSlowAndStrict();
     disconnect();
     CHECK(!connected());
 

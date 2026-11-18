@@ -84,6 +84,9 @@ std::mutex gHookMu;
 std::atomic<bool> gDebug{false};
 std::function<void(const std::string &, const std::string &, const Value &)> gDebugFn;
 std::function<void(const std::string &, const std::string &)> gIndexErrorFn;
+std::atomic<int64_t> gSlowMs{0};
+std::function<void(const SlowQuery &)> gSlowFn;
+std::atomic<bool> gStrictQuery{false};
 
 std::shared_ptr<Conn> currentConn() {
     std::lock_guard<std::mutex> lk(gConnMu);
@@ -157,6 +160,82 @@ void reportIndexError(const std::string &model, const std::string &msg) {
         std::cerr << "nevla: could not create indexes for model \"" << model << "\": " << msg << "\n";
 }
 
+// Index suggestion with the ESR rule: Equality fields, then Sort fields, then Range fields
+std::string suggestIndex(const Value &args) {
+    Value filter = args["filter"];
+    if (args["pipeline"].isArray())
+        for (const auto &st : args["pipeline"].elements()) {
+            if (st.contains("$match")) filter = st["$match"];
+            break;
+        }
+    std::vector<std::string> eq, range, sortKeys;
+    for (const auto &kv : filter.items()) {
+        if (kv.first.empty() || kv.first[0] == '$' || kv.first == "_id") continue;
+        bool isRange = false;
+        if (kv.second.isObject())
+            for (const auto &op : kv.second.items())
+                isRange |= op.first == "$gt" || op.first == "$gte" || op.first == "$lt" || op.first == "$lte" ||
+                           op.first == "$ne" || op.first == "$nin" || op.first == "$regex" || op.first == "$exists";
+        (isRange ? range : eq).push_back(kv.first);
+    }
+    Value sort = args["sort"];
+    std::string out;
+    std::set<std::string> used;
+    auto add = [&](const std::string &f, const Value &dir) {
+        if (!used.insert(f).second) return;
+        out += (out.empty() ? "" : ", ") + f + ": " + dir.str();
+    };
+    for (const auto &f : eq) add(f, 1);
+    for (const auto &kv : sort.items()) add(kv.first, kv.second);
+    for (const auto &f : range) add(f, 1);
+    return out.empty() ? "" : "consider an index {" + out + "}";
+}
+
+// Logs an operation (setDebug) and reports it when it is slow (setSlowQueryThreshold)
+class OpTrace {
+  public:
+    OpTrace(const std::string &coll, const std::string &op, Value args) {
+        debugLog(coll, op, args);
+        int64_t limit = gSlowMs.load();
+        if (limit <= 0) return;
+        active_ = true;
+        limit_ = limit;
+        coll_ = coll;
+        op_ = op;
+        args_ = std::move(args);
+        t0_ = std::chrono::steady_clock::now();
+    }
+    ~OpTrace() {
+        if (!active_) return;
+        int64_t ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0_).count();
+        if (ms < limit_) return;
+        try {
+            SlowQuery q{coll_, op_, ms, args_, suggestIndex(args_)};
+            std::function<void(const SlowQuery &)> fn;
+            {
+                std::lock_guard<std::mutex> lk(gHookMu);
+                fn = gSlowFn;
+            }
+            if (fn)
+                fn(q);
+            else
+                std::cerr << "nevla: slow " << coll_ << "." << op_ << " took " << ms << " ms: " << args_.toJson()
+                          << (q.suggestion.empty() ? "" : " -> " + q.suggestion) << "\n";
+        } catch (...) {  // a logger must never break the operation
+        }
+    }
+    OpTrace(const OpTrace &) = delete;
+    OpTrace &operator=(const OpTrace &) = delete;
+
+  private:
+    bool active_ = false;
+    int64_t limit_ = 0;
+    std::string coll_, op_;
+    Value args_;
+    std::chrono::steady_clock::time_point t0_;
+};
+
 // Members are destroyed in reverse order: coll -> entry -> conn (pool outlives the client)
 struct Op {
     std::shared_ptr<Conn> conn;
@@ -203,7 +282,7 @@ void createIndexesNow(ModelImpl &m, Conn &c) {
         auto entry = c.pool->acquire();
         auto coll = (*entry)[c.db][m.collection];
         for (const auto &i : wantedIndexes(m)) {
-            debugLog(m.collection, "createIndex", Value{{"keys", i.keys}, {"options", i.options}});
+            OpTrace nv_trace(m.collection, "createIndex", Value{{"keys", i.keys}, {"options", i.options}});
             coll.create_index(toBson(i.keys), toBson(i.options));
         }
     });
@@ -322,7 +401,7 @@ bool isOperatorObject(const Value &v) {
     return true;
 }
 
-Value castFilter(const Schema &s, const Value &filter);
+Value castFilter(const Schema &s, const Value &filter, const std::string *strictModel = nullptr);
 
 // One filter value in the field's type (for an array field a single element also matches)
 Value castScalar(const Schema &s, const Field &f, const Value &v, const std::string &path) {
@@ -364,18 +443,67 @@ Value castOperand(const Schema &s, const Field &f, const Value &v, const std::st
     return out;
 }
 
-Value castFilter(const Schema &s, const Value &filter) {
+size_t editDistance(const std::string &a, const std::string &b) {
+    std::vector<size_t> prev(b.size() + 1), cur(b.size() + 1);
+    for (size_t j = 0; j <= b.size(); j++) prev[j] = j;
+    for (size_t i = 1; i <= a.size(); i++) {
+        cur[0] = i;
+        for (size_t j = 1; j <= b.size(); j++)
+            cur[j] = std::min({prev[j] + 1, cur[j - 1] + 1,
+                               prev[j - 1] + (std::tolower(a[i - 1]) == std::tolower(b[j - 1]) ? 0 : 1)});
+        std::swap(prev, cur);
+    }
+    return prev[b.size()];
+}
+
+void knownPaths(const Schema &s, const std::string &prefix, std::vector<std::string> &out) {
+    for (const auto &kv : s.fields()) {
+        out.push_back(prefix + kv.first);
+        if (!kv.second.alias_.empty()) out.push_back(prefix + kv.second.alias_);
+        if ((kv.second.type == FieldType::Object || kv.second.type == FieldType::Array) && kv.second.schema_)
+            knownPaths(*kv.second.schema_, prefix + kv.first + ".", out);
+    }
+    if (prefix.empty()) {
+        if (s.options.timestamps) {
+            out.push_back(s.options.createdAt);
+            out.push_back(s.options.updatedAt);
+        }
+    }
+}
+
+[[noreturn]] void unknownPath(const Schema &s, const std::string &model, const std::string &path) {
+    std::vector<std::string> known;
+    knownPaths(s, "", known);
+    std::string best;
+    size_t bestD = std::max<size_t>(2, path.size() / 3) + 1;
+    for (const auto &k : known) {
+        size_t d = editDistance(path, k);
+        if (d < bestD) {
+            bestD = d;
+            best = k;
+        }
+    }
+    throw Error("nevla: unknown path \"" + path + "\" in a filter on model \"" + model + "\" (strictQuery)" +
+                (best.empty() ? "" : ". Did you mean \"" + best + "\"?"));
+}
+
+// strictModel != nullptr: a path that is not in the schema throws (strictQuery)
+Value castFilter(const Schema &s, const Value &filter, const std::string *strictModel) {
     Value out = Value::object();
     for (const auto &m : filter.items()) {
         if (m.first == "$and" || m.first == "$or" || m.first == "$nor") {
             Value arr = Value::array();
-            for (const auto &e : m.second.elements()) arr.push_back(castFilter(s, e));
+            for (const auto &e : m.second.elements()) arr.push_back(castFilter(s, e, strictModel));
             out[m.first] = std::move(arr);
             continue;
         }
         std::string key = m.first.empty() || m.first[0] == '$' ? m.first : s.resolveAlias(m.first);
         bool mixed = false;
         const Field *f = key.empty() || key[0] == '$' ? nullptr : s.path(key, &mixed);
+        if (!f && strictModel && !key.empty() && key[0] != '$') {
+            std::string top = key.substr(0, key.find('.'));
+            if (top != s.options.versionKey && top != s.options.discriminatorKey) unknownPath(s, *strictModel, key);
+        }
         out[key] = (f && !mixed) ? castOperand(s, *f, m.second, key) : m.second;
     }
     return out;
@@ -388,7 +516,8 @@ Value asFilter(const Value &filter) {
 }
 
 Value prepareFilter(ModelImpl &m, const Value &filter) {
-    Value out = castFilter(m.schema, asFilter(filter));
+    bool strict = m.schema.options.strictQuery || gStrictQuery.load();
+    Value out = castFilter(m.schema, asFilter(filter), strict ? &m.name : nullptr);
     if (!m.discKey.empty()) out[m.discKey] = m.discValue;
     return out;
 }
@@ -784,7 +913,7 @@ std::vector<Value> runFind(const std::shared_ptr<ModelImpl> &m, const detail::Qu
     std::vector<Value> out;
     guard([&] {
         Op o = open(*m);
-        debugLog(m->collection, opName, Value{{"filter", filter}, {"sort", spec.sort}, {"limit", spec.limit}});
+        OpTrace nv_trace(m->collection, opName, Value{{"filter", filter}, {"sort", spec.sort}, {"limit", spec.limit}});
         retryRead([&] {
             out.clear();
             auto cursor = NV(o, find, toBson(filter), opts);
@@ -838,7 +967,8 @@ UpdateResult runUpdate(const std::shared_ptr<ModelImpl> &m, const Value &filterI
     if (options.upsert) opts.upsert(true);
     guard([&] {
         Op o = open(*m);
-        debugLog(m->collection, opName, Value{{"filter", filter}, {"update", update}, {"upsert", options.upsert}});
+        OpTrace nv_trace(m->collection, opName,
+                         Value{{"filter", filter}, {"update", update}, {"upsert", options.upsert}});
         auto r = many ? NV(o, update_many, toBson(filter), toBson(update), opts)
                       : NV(o, update_one, toBson(filter), toBson(update), opts);
         if (!r) return;
@@ -859,7 +989,7 @@ int64_t runDelete(const std::shared_ptr<ModelImpl> &m, const Value &filterIn, bo
     runQueryHooks(*m, opName, filter, nullptr);
     int64_t n = guard([&]() -> int64_t {
         Op o = open(*m);
-        debugLog(m->collection, opName, Value{{"filter", filter}});
+        OpTrace nv_trace(m->collection, opName, Value{{"filter", filter}});
         auto r = many ? NV(o, delete_many, toBson(filter)) : NV(o, delete_one, toBson(filter));
         return r ? r->deleted_count() : 0;
     });
@@ -880,7 +1010,7 @@ int64_t runCount(const std::shared_ptr<ModelImpl> &m, const detail::QuerySpec &s
     if (spec.collation.isObject()) opts.collation(toBson(spec.collation));
     int64_t n = guard([&]() -> int64_t {
         Op o = open(*m);
-        debugLog(m->collection, "countDocuments", Value{{"filter", filter}});
+        OpTrace nv_trace(m->collection, "countDocuments", Value{{"filter", filter}});
         return NV(o, count_documents, toBson(filter), opts);
     });
     if (hasPostHooks(*m, "countDocuments")) {
@@ -897,7 +1027,7 @@ std::vector<Value> runDistinct(const std::shared_ptr<ModelImpl> &m, const std::s
     std::vector<Value> out;
     guard([&] {
         Op o = open(*m);
-        debugLog(m->collection, "distinct", Value{{"field", path}, {"filter", filter}});
+        OpTrace nv_trace(m->collection, "distinct", Value{{"field", path}, {"filter", filter}});
         auto cursor = NV(o, distinct, path, toBson(filter));
         for (auto &&doc : cursor) {
             Value row = fromBson(doc);
@@ -1028,6 +1158,14 @@ void setDebug(std::function<void(const std::string &, const std::string &, const
     gDebug = static_cast<bool>(fn);
     gDebugFn = std::move(fn);
 }
+
+void setSlowQueryThreshold(int64_t ms, std::function<void(const SlowQuery &)> fn) {
+    std::lock_guard<std::mutex> lk(gHookMu);
+    gSlowFn = std::move(fn);
+    gSlowMs = ms < 0 ? 0 : ms;
+}
+
+void setStrictQuery(bool on) { gStrictQuery = on; }
 
 void onIndexError(std::function<void(const std::string &, const std::string &)> fn) {
     std::lock_guard<std::mutex> lk(gHookMu);
@@ -1249,7 +1387,7 @@ Document &Document::save() {
         for (const auto &p : populated_) depopulatePath(m_->schema, stored, p);
         guard([&] {
             Op o = open(*m_);
-            debugLog(m_->collection, "insertOne", stored);
+            OpTrace nv_trace(m_->collection, "insertOne", stored);
             NV(o, insert_one, toBson(stored));
         });
         isNew_ = false;
@@ -1297,7 +1435,7 @@ Document &Document::save() {
         if (!update.empty()) {
             int64_t matched = guard([&]() -> int64_t {
                 Op o = open(*m_);
-                debugLog(m_->collection, "updateOne", Value{{"filter", filter}, {"update", update}});
+                OpTrace nv_trace(m_->collection, "updateOne", Value{{"filter", filter}, {"update", update}});
                 auto r = NV(o, update_one, toBson(filter), toBson(update));
                 return r ? r->matched_count() : 0;
             });
@@ -1326,7 +1464,7 @@ void Document::deleteOne() {
     runDocHooks(m_->schema.preDoc_, "deleteOne", *this);
     guard([&] {
         Op o = open(*m_);
-        debugLog(m_->collection, "deleteOne", idFilter(data_["_id"]));
+        OpTrace nv_trace(m_->collection, "deleteOne", idFilter(data_["_id"]));
         NV(o, delete_one, toBson(idFilter(data_["_id"])));
     });
     runDocHooks(m_->schema.postDoc_, "deleteOne", *this);
@@ -1432,7 +1570,7 @@ Cursor Query::cursor() {
     applyFindOptions(opts, spec_, m_->schema, false);
     guard([&] {
         impl->op = open(*m_);
-        debugLog(m_->collection, "find (cursor)", Value{{"filter", filter}});
+        OpTrace nv_trace(m_->collection, "find (cursor)", Value{{"filter", filter}});
         impl->cursor = std::make_unique<mongocxx::cursor>(NV(impl->op, find, toBson(filter), opts));
     });
     Cursor c;
@@ -1570,7 +1708,7 @@ std::vector<Document> Model::insertMany(const std::vector<Value> &objects, Inser
     opts.ordered(options.ordered);
     guard([&] {
         Op o = open(*m_);
-        debugLog(m_->collection, "insertMany", Value{{"count", static_cast<int64_t>(raw.size())}});
+        OpTrace nv_trace(m_->collection, "insertMany", Value{{"count", static_cast<int64_t>(raw.size())}});
         NV(o, insert_many, raw, opts);
     });
     for (auto &d : docs) {
@@ -1606,7 +1744,7 @@ UpdateResult Model::replaceOne(const Value &filterIn, const Value &replacement, 
     UpdateResult res;
     guard([&] {
         Op o = open(*m_);
-        debugLog(m_->collection, "replaceOne", Value{{"filter", filter}, {"replacement", doc}});
+        OpTrace nv_trace(m_->collection, "replaceOne", Value{{"filter", filter}, {"replacement", doc}});
         auto r = NV(o, replace_one, toBson(filter), toBson(doc), opts);
         if (!r) return;
         res.matchedCount = r->matched_count();
@@ -1637,7 +1775,7 @@ std::optional<Document> Model::findOneAndUpdate(const Value &filterIn, const Val
     if (!proj.empty()) opts.projection(toBson(proj));
     auto found = guard([&]() -> std::optional<Value> {
         Op o = open(*m_);
-        debugLog(m_->collection, "findOneAndUpdate", Value{{"filter", filter}, {"update", update}});
+        OpTrace nv_trace(m_->collection, "findOneAndUpdate", Value{{"filter", filter}, {"update", update}});
         auto r = NV(o, find_one_and_update, toBson(filter), toBson(update), opts);
         if (!r) return std::nullopt;
         return fromBson(r->view());
@@ -1669,7 +1807,7 @@ std::optional<Document> Model::findOneAndReplace(const Value &filterIn, const Va
     if (!proj.empty()) opts.projection(toBson(proj));
     auto found = guard([&]() -> std::optional<Value> {
         Op o = open(*m_);
-        debugLog(m_->collection, "findOneAndReplace", Value{{"filter", filter}, {"replacement", doc}});
+        OpTrace nv_trace(m_->collection, "findOneAndReplace", Value{{"filter", filter}, {"replacement", doc}});
         auto r = NV(o, find_one_and_replace, toBson(filter), toBson(doc), opts);
         if (!r) return std::nullopt;
         return fromBson(r->view());
@@ -1688,7 +1826,7 @@ std::optional<Document> Model::findOneAndDelete(const Value &filterIn) const {
     runQueryHooks(*m_, "findOneAndDelete", filter, nullptr);
     auto found = guard([&]() -> std::optional<Value> {
         Op o = open(*m_);
-        debugLog(m_->collection, "findOneAndDelete", Value{{"filter", filter}});
+        OpTrace nv_trace(m_->collection, "findOneAndDelete", Value{{"filter", filter}});
         auto r = NV(o, find_one_and_delete, toBson(filter));
         if (!r) return std::nullopt;
         return fromBson(r->view());
@@ -1745,7 +1883,7 @@ BulkWriteResult Model::bulkWrite(const std::vector<Value> &operations, bool orde
     if (ops.empty()) return res;
     guard([&] {
         Op o = open(*m_);
-        debugLog(m_->collection, "bulkWrite", Value{{"operations", static_cast<int64_t>(ops.size())}});
+        OpTrace nv_trace(m_->collection, "bulkWrite", Value{{"operations", static_cast<int64_t>(ops.size())}});
         mongocxx::options::bulk_write bopts;
         bopts.ordered(ordered);
         auto bulk = o.session ? o.coll.create_bulk_write(*o.session, bopts) : o.coll.create_bulk_write(bopts);
@@ -1852,7 +1990,7 @@ std::vector<Value> runAggregate(const std::shared_ptr<ModelImpl> &m, Value stage
     std::vector<Value> out;
     guard([&] {
         Op op = open(*m);
-        debugLog(m->collection, "aggregate", stages);
+        OpTrace nv_trace(m->collection, "aggregate", Value{{"pipeline", stages}});
         bool writes = false;  // $out / $merge must not run twice
         for (const auto &st : stages.elements()) writes |= st.contains("$out") || st.contains("$merge");
         auto run = [&] {
@@ -2449,7 +2587,7 @@ ChangeStream Model::watch(const Value &pipeline, WatchOptions options) const {
     if (options.maxAwaitMS > 0) opts.max_await_time(std::chrono::milliseconds(options.maxAwaitMS));
     guard([&] {
         impl->op = open(*m_);
-        debugLog(m_->collection, "watch", pipeline);
+        OpTrace nv_trace(m_->collection, "watch", pipeline);
         impl->stream = std::make_unique<mongocxx::change_stream>(NV(impl->op, watch, p, opts));
     });
     ChangeStream cs;
@@ -2502,7 +2640,7 @@ void Model::syncIndexes() const {
         if (keep.count(keys.toJson())) continue;
         guard([&] {
             Op o = open(*m_);
-            debugLog(m_->collection, "dropIndex", Value(name));
+            OpTrace nv_trace(m_->collection, "dropIndex", Value(name));
             o.coll.indexes().drop_one(name);
         });
     }
@@ -2511,7 +2649,7 @@ void Model::syncIndexes() const {
 void Model::dropCollection() const {
     guard([&] {
         Op o = open(*m_);
-        debugLog(m_->collection, "drop", Value::object());
+        OpTrace nv_trace(m_->collection, "drop", Value::object());
         o.coll.drop();
     });
     m_->indexGen = 0;  // recreate indexes before the next operation

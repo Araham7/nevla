@@ -1,998 +1,804 @@
-# nevla — C++ ke liye Mongoose jaisa MongoDB ODM
+# nevla
 
-> **nevla** (नेवला) = Hindi me "mongoose". Naam bas placeholder hai, jo chaho rakh lo (neeche "Naam badalna" dekho).
+**A Mongoose-style ODM for MongoDB in modern C++ (C++20).**
 
-Node.js me jo kaam **Mongoose** karta hai (schema, validation, defaults, hooks, populate…), wahi kaam C++20 me.
-Neeche official `mongocxx` driver chalta hai; nevla uske upar ek aasaan layer hai.
+Schemas, validation, casting, defaults, middleware (hooks), populate, virtuals, discriminators, transactions,
+change streams and a chainable query builder — the API you know from Node.js
+[Mongoose](https://mongoosejs.com), on top of the official MongoDB C++ driver (`mongocxx`).
+
+> *nevla* (नेवला) is the Hindi word for *mongoose*.
+
+[![CI](https://github.com/<your-username>/nevla/actions/workflows/ci.yml/badge.svg)](https://github.com/<your-username>/nevla/actions/workflows/ci.yml)
+![C++20](https://img.shields.io/badge/C%2B%2B-20-blue)
+![License: MIT](https://img.shields.io/badge/license-MIT-green)
 
 ```cpp
 #include <nevla/nevla.hpp>
 using namespace nevla;
 
 int main() {
-    connect("mongodb://127.0.0.1:27017", "mydb");
+    connect("mongodb://127.0.0.1:27017/shop");
 
     Schema userSchema({
-        {"name",  String().required().trim()},
-        {"email", String().required().lowercase().unique()},
-        {"age",   Int().min(0)},
+        {"name",  String().required().trim().minLength(2)},
+        {"email", String().required().lowercase().unique().match(R"(^\S+@\S+\.\S+$)")},
+        {"age",   Int().min(13, "{PATH} must be at least 13, got {VALUE}")},
         {"role",  String().enumOf({"user", "admin"}).def("user")},
     }, {.timestamps = true});
 
-    auto User = model("User", userSchema);
+    auto User = model("User", userSchema);   // collection "users"
 
-    auto u = User.create({{"name", "Araham"}, {"email", "A@X.in"}, {"age", 24}});
-    auto adults = User.find().where("age").gte(18).sort("-age").limit(10).exec();
-    u.set("age", 25).save();
+    auto u = User.create({{"name", " Asha "}, {"email", "ASHA@X.IN"}, {"age", "24"}});  // trimmed, lowercased, cast
+    auto adults = User.find().where("age").gte(18).sort("-createdAt").limit(10).exec();
+    u.set("age", 25).save();                 // sends only {$set: {age: 25, updatedAt: ...}}
 }
 ```
 
----
-
-## Index
-
-1. [Ye kya hai, aur kyun](#1-ye-kya-hai-aur-kyun)
-2. [Install + build](#2-install--build)
-3. [Apne project me jodna](#3-apne-project-me-jodna)
-4. [Connect](#4-connect)
-5. [Value — JSON jaisa data](#5-value--json-jaisa-data)
-6. [Schema + field types](#6-schema--field-types)
-7. [Validation](#7-validation)
-8. [Defaults, setters, cast](#8-defaults-setters-cast)
-9. [Model + Document banana](#9-model--document-banana)
-10. [Padhna: find / findOne / findById](#10-padhna-find--findone--findbyid)
-11. [Query builder](#11-query-builder)
-12. [Document badalna + save()](#12-document-badalna--save)
-13. [Seedha update: updateOne / updateMany / findOneAndUpdate](#13-seedha-update)
-14. [Delete](#14-delete)
-15. [count / exists / distinct / aggregate](#15-count--exists--distinct--aggregate)
-16. [Nested object + sub-document array](#16-nested-object--sub-document-array)
-17. [populate (ref)](#17-populate-ref)
-18. [Hooks (middleware)](#18-hooks-middleware)
-19. [Virtuals, methods, toJSON](#19-virtuals-methods-tojson)
-20. [Indexes (unique, compound, TTL)](#20-indexes)
-21. [Custom `_id` (string / UUID)](#21-custom-_id)
-22. [Discriminators (ek collection, kai type)](#22-discriminators)
-23. [Transactions](#23-transactions)
-24. [Typed struct: `NEVLA_STRUCT`](#24-typed-struct-nevla_struct)
-25. [Errors](#25-errors)
-26. [Threads + async](#26-threads--async)
-27. [Schema options](#27-schema-options)
-28. [Mongoose ↔ nevla cheat-sheet](#28-mongoose--nevla-cheat-sheet)
-29. [Mongoose se kya alag hai / kya nahi hai](#29-mongoose-se-kya-alag-hai)
-30. [Tests, examples, folder](#30-tests-examples-folder)
-31. [Open-source karne ke steps](#31-open-source-karne-ke-steps)
+Hindi/Hinglish guide: [docs/README.hinglish.md](docs/README.hinglish.md)
 
 ---
 
-## 1. Ye kya hai, aur kyun
+## Contents
 
-C++ ke jo open-source MongoDB ODM pehle se hain, wo sab **"struct mapper"** hain: apna struct BSON me badlo aur wapas.
-Mongoose wali cheezein (validation, defaults, hooks, populate) unme nahi hain.
-
-| Library | Tarika | Haalat | Schema validation | Hooks | Populate |
-|---|---|---|---|---|---|
-| Mangrove (MongoDB ka apna) | CRTP model + macro | archived (band) | ✗ | ✗ | ✗ |
-| MongoXX | Mapper `add_field` | chhota project | ✗ | ✗ | ✗ |
-| quarkpunk/mongoose | struct serializer | chhota project | ✗ | ✗ | ✗ |
-| Congo | chainable query | chhota project | ✗ | ✗ | ✗ |
-| ThorsMongo | struct serializer | active, **GPL** | ✗ | ✗ | ✗ |
-| **nevla** | Mongoose-style runtime schema **+** struct mapping | ye | ✓ | ✓ | ✓ |
-
-nevla me dono raste hain:
-
-- **Dynamic** (Mongoose jaisa): `doc["name"]`, `doc.set("age", 5)`
-- **Typed**: `NEVLA_STRUCT` se apna C++ struct seedha (section 24)
-
-Ye Mongoose ka **exact copy nahi** hai (C++ me JavaScript jaisa `doc.name = "x"` ho hi nahi sakta), par soch aur naam wahi hain. Farq section 29 me likhe hain.
+1. [Why nevla](#why-nevla)
+2. [Requirements and installation](#requirements-and-installation)
+3. [Using nevla in your project](#using-nevla-in-your-project)
+4. [Connecting](#connecting)
+5. [Value: dynamic JSON/BSON data](#value-dynamic-jsonbson-data)
+6. [Schemas and field types](#schemas-and-field-types)
+7. [Validation](#validation)
+8. [Casting, defaults, setters, getters, aliases](#casting-defaults-setters-getters-aliases)
+9. [Models and documents](#models-and-documents)
+10. [Querying](#querying)
+11. [Cursors and pagination](#cursors-and-pagination)
+12. [Updating](#updating)
+13. [Deleting](#deleting)
+14. [Bulk writes](#bulk-writes)
+15. [Aggregation, distinct, counting](#aggregation-distinct-counting)
+16. [Sub-documents, arrays and maps](#sub-documents-arrays-and-maps)
+17. [Populate](#populate)
+18. [Middleware (hooks)](#middleware-hooks)
+19. [Virtuals, methods, statics, plugins, toJSON](#virtuals-methods-statics-plugins-tojson)
+20. [Indexes](#indexes)
+21. [Custom `_id`](#custom-_id)
+22. [Discriminators](#discriminators)
+23. [Versioning and optimistic concurrency](#versioning-and-optimistic-concurrency)
+24. [Transactions](#transactions)
+25. [Change streams](#change-streams)
+26. [Typed structs with `NEVLA_STRUCT`](#typed-structs-with-nevla_struct)
+27. [Errors](#errors)
+28. [Threads, async and debugging](#threads-async-and-debugging)
+29. [Schema options](#schema-options)
+30. [Mongoose → nevla cheat sheet](#mongoose--nevla-cheat-sheet)
+31. [Differences from Mongoose](#differences-from-mongoose)
+32. [Project layout, tests and examples](#project-layout-tests-and-examples)
+33. [Contributing, changelog, license](#contributing-changelog-license)
 
 ---
 
-## 2. Install + build
+## Why nevla
 
-Chahiye: **g++ 11+ ya clang 14+ (C++20)**, **CMake 3.16+**, **mongocxx 3.8+**.
+The official `mongocxx` driver is powerful but low-level: you build BSON by hand, there is no schema, no
+validation, no defaults, no relations. Every application ends up re-writing the same glue.
 
-### Ubuntu 22.04 / 24.04
+nevla gives C++ the developer experience of Mongoose:
+
+| You get | Example |
+|---|---|
+| Schemas with types, validation and defaults | `Int().min(0).max(150)`, `String().enumOf({...})` |
+| Automatic casting | `"24"` → `24`, `"2026-01-31"` → `Date`, hex string → `ObjectId` |
+| Change tracking | `doc.set(...).save()` only sends the changed paths |
+| Chainable queries | `User.find().where("age").gte(18).sort("-age").limit(10).exec()` |
+| Relations | `populate("author")`, nested populate, virtual populate |
+| Middleware | `pre/post` hooks for `save`, `validate`, `find`, `updateOne`, `aggregate`, ... |
+| Real-world features | transactions, change streams, bulk writes, cursors, pagination, optimistic concurrency |
+| C++ comfort | `NEVLA_STRUCT` maps your structs to documents at compile time |
+
+It is **thread-safe**, uses a **connection pool**, and is tested against a real MongoDB server
+(including AddressSanitizer / UBSan runs).
+
+---
+
+## Requirements and installation
+
+- A C++20 compiler: **g++ 11+** or **clang 14+**
+- **CMake 3.16+**
+- **mongocxx 3.8+** (the MongoDB C++ driver; tested with 3.10.2)
+- A MongoDB server (4.4+; transactions and change streams need a replica set or Atlas)
+
+### 1. Install the MongoDB C++ driver (Ubuntu 22.04 / 24.04)
 
 ```bash
 sudo apt update
 sudo apt install -y build-essential cmake curl libmongoc-dev libbson-dev libssl-dev
 
-# mongocxx (C++ driver) source se: apt me nahi milta
 curl -OL https://github.com/mongodb/mongo-cxx-driver/releases/download/r3.10.2/mongo-cxx-driver-r3.10.2.tar.gz
 tar xzf mongo-cxx-driver-r3.10.2.tar.gz
 cd mongo-cxx-driver-r3.10.2/build
 cmake .. -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_STANDARD=17 -DCMAKE_INSTALL_PREFIX=/usr/local
-make -j$(nproc)
-sudo make install
+cmake --build . -j$(nproc)
+sudo cmake --install .
 sudo ldconfig
 cd ../..
 ```
 
-### nevla build
+macOS: `brew install mongo-cxx-driver`. Windows: `vcpkg install mongo-cxx-driver`.
+
+### 2. Build nevla
 
 ```bash
+git clone https://github.com/<your-username>/nevla.git
 cd nevla
-mkdir build && cd build
-cmake ..
-make -j$(nproc)
+cmake -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j$(nproc)
 
-./nevla_tests          # MongoDB 127.0.0.1:27017 par chalna chahiye
-./01_quickstart
-sudo make install      # optional: /usr/local me daal do
+# optional: run the tests (needs MongoDB on 127.0.0.1:27017)
+./build/nevla_tests
+# optional: install system-wide
+sudo cmake --install build
 ```
 
-Tests kisi aur server par chalane ho to: `NEVLA_TEST_URI="mongodb://host:27017" ./nevla_tests`
+CMake options: `-DNEVLA_BUILD_TESTS=OFF -DNEVLA_BUILD_EXAMPLES=OFF` (both default to `ON` only when nevla is
+the top-level project).
+
+### A MongoDB server for development
+
+```bash
+# Docker, single-node replica set (transactions + change streams work)
+docker run -d --name mongo -p 27017:27017 mongo:7 --replSet rs0
+docker exec mongo mongosh --quiet --eval 'rs.initiate()'
+```
+
+Use `mongodb://127.0.0.1:27017/?directConnection=true` to connect to it.
 
 ---
 
-## 3. Apne project me jodna
+## Using nevla in your project
 
-**Tarika A — folder copy karke (sabse aasaan):**
+**A. `add_subdirectory` (vendored copy)**
 
 ```cmake
 cmake_minimum_required(VERSION 3.16)
 project(myapp CXX)
 set(CMAKE_CXX_STANDARD 20)
 
-add_subdirectory(third_party/nevla)          # nevla ka folder yahan rakho
+add_subdirectory(third_party/nevla)
 add_executable(myapp main.cc)
 target_link_libraries(myapp PRIVATE nevla::nevla)
 ```
 
-**Tarika B — `sudo make install` ke baad:**
-
-```cmake
-find_package(nevla REQUIRED)
-target_link_libraries(myapp PRIVATE nevla::nevla)
-```
-
-**Tarika C — GitHub par daalne ke baad (FetchContent):**
+**B. `FetchContent`**
 
 ```cmake
 include(FetchContent)
-FetchContent_Declare(nevla GIT_REPOSITORY https://github.com/<tum>/nevla.git GIT_TAG v0.1.0)
+FetchContent_Declare(nevla GIT_REPOSITORY https://github.com/<your-username>/nevla.git GIT_TAG v0.2.0)
 FetchContent_MakeAvailable(nevla)
 target_link_libraries(myapp PRIVATE nevla::nevla)
 ```
 
-Code me bas ek include:
+**C. After `cmake --install`**
+
+```cmake
+find_package(nevla 0.2 CONFIG REQUIRED)
+target_link_libraries(myapp PRIVATE nevla::nevla)
+```
+
+Then a single include:
 
 ```cpp
 #include <nevla/nevla.hpp>
 using namespace nevla;
 ```
 
-> `-Wextra` ke saath `{.timestamps = true}` par g++ "missing initializer" warning deta hai. Wo galti nahi hai; `-Wno-missing-field-initializers` laga do.
+> With `-Wextra`, g++ warns *"missing initializer"* for designated initializers such as `{.timestamps = true}`.
+> That is a GCC quirk, not a bug; add `-Wno-missing-field-initializers` if it bothers you.
 
 ---
 
-## 4. Connect
+## Connecting
 
 ```cpp
-connect("mongodb://127.0.0.1:27017", "mydb");            // URI + database
-connect("mongodb://127.0.0.1:27017/mydb");               // database URI me
-connect("mongodb+srv://user:pass@cluster.mongodb.net/mydb?retryWrites=true");   // Atlas
+connect("mongodb://127.0.0.1:27017", "mydb");          // URI + database name
+connect("mongodb://127.0.0.1:27017/mydb");             // database from the URI
+connect("mongodb+srv://user:pass@cluster0.mongodb.net/mydb?retryWrites=true&w=majority");  // Atlas
 
-if (connected()) { /* ... */ }
+connected();          // bool
+databaseName();       // "mydb"
+ping();               // throws nevla::Error if the server is unreachable
 disconnect();
 ```
 
-- `connect()` server ko ping karta hai; server band ho to wahin `nevla::Error` aata hai.
-- Andar connection **pool** hai, isliye kai threads se ek saath use kar sakte ho.
-- Database na URI me ho na argument me, to `"test"` use hota hai.
-- Models `connect()` se pehle bhi bana sakte ho; DB ka kaam `connect()` ke baad hi chalega.
+- `connect()` pings the server and throws `nevla::Error` right away if it is unreachable.
+- There is a connection **pool** inside, so every model can be used from many threads at once.
+- `connect()` may be called again (reconnect / switch database). Operations that are already running keep
+  the old pool alive until they finish — no crash, no dangling pointers.
+- No database in the URI and none passed → `"test"`.
+- Models may be created before `connect()`; database operations need a connection.
 
 ---
 
-## 5. Value — JSON jaisa data
+## Value: dynamic JSON/BSON data
 
-`Value` nevla ka JSON/BSON type hai: null, bool, int, double, string, `Date`, `ObjectId`, array, object.
-
-```cpp
-Value v = {
-    {"name", "Araham"},
-    {"age", 24},
-    {"ok", true},
-    {"tags", Value::array({"iot", "cpp"})},
-    {"address", {{"city", "Durgapur"}, {"pin", 713402}}},
-    {"joined", Date::now()},
-};
-
-v["name"].asString();            // "Araham"
-v["age"].asInt();                // 24
-v["address"]["city"].asString(); // "Durgapur"
-v["tags"].at(0).asString();      // "iot"
-v["tags"].size();                // 2
-v.contains("age");               // true
-
-v["city"] = "Burdwan";           // naya key
-v.erase("ok");
-
-// dotted path
-const Value *pin = v.path("address.pin");   // na ho to nullptr
-v.pathRef("a.b.c") = 5;                     // raste ke objects khud ban jaate hain
-v.erasePath("a.b.c");
-
-// loop
-for (const auto &tag : v["tags"].elements()) std::cout << tag.asString();
-for (const auto &[key, val] : v.items())     std::cout << key << " = " << val.toJson();
-
-// JSON
-std::string text = v.toJson();        // ek line
-std::string nice = v.toJson(2);       // indent ke saath
-Value back = Value::parse(R"({"a":[1,2,3]})");
-
-// C++ types
-int age                       = v["age"].as<int>();
-std::vector<std::string> tags = v["tags"].as<std::vector<std::string>>();
-Value fromVector              = std::vector<int>{1, 2, 3};
-```
-
-**Array ya object?** `{...}` ke andar har item `{"string", kuch}` ho to object banta hai, warna array.
-Pairs ka array hi chahiye, ya khaali/ek-item array, to saaf likho:
+`Value` is nevla's JSON/BSON type: null, bool, int64, double, string, `Date`, `ObjectId`, array and object.
+Objects keep insertion order (like BSON).
 
 ```cpp
-Value a = Value::array({"x", 1});   // ["x", 1]  (hamesha array)
-Value e = Value::array();           // []
-Value o = Value::object();          // {}
+Value v = {{"name", "Asha"}, {"age", 21}, {"tags", Value::array({"iot", "cpp"})},
+           {"address", {{"city", "Durgapur"}, {"pin", 713209}}}};
+
+v["name"].asString();         // "Asha"
+v["age"].asInt();             // 21
+v.path("address.city")->str();
+v["missing"].isNull();        // true (const access never creates keys)
+v["score"] = 9.5;             // non-const access creates the key
+v.pathRef("meta.seen") = true;
+v.erasePath("address.pin");
+
+for (auto &[key, val] : v.items()) { /* object members */ }
+for (auto &e : v["tags"].elements()) { /* array items */ }
+
+std::string json = v.toJson(2);                  // pretty JSON
+Value back = Value::parse(R"({"a": 1, "when": {"$date": "2026-01-31T10:00:00Z"}})");  // Extended JSON ok
 ```
 
-**Getters lenient hain:** `asInt()`, `asDouble()`, `asBool()` type alag ho to convert karne ki koshish karte hain, na ho to fallback (`asInt(-1)`). `asString()` string na ho to `""`. Kisi bhi scalar ka text chahiye to `str()`.
-
-**Date + ObjectId:**
-
-```cpp
-Date now = Date::now();                               // UTC, milliseconds
-auto d = Date::parse("2026-11-17T10:30:00.000Z");     // std::optional<Date>
-if (d) std::cout << d->iso() << " " << d->ms;
-
-ObjectId id = ObjectId::generate();
-id.str();                                             // 24 hex characters
-ObjectId::isValid("6afb9f7045827a9e0d061d21");        // true
-```
-
----
-
-## 6. Schema + field types
-
-```cpp
-Schema s({
-    {"name",    String()},
-    {"age",     Int()},                     // sirf poora number
-    {"price",   Number()},                  // int ya double
-    {"active",  Boolean()},
-    {"born",    DateTime()},
-    {"owner",   Id()},                      // ObjectId
-    {"extra",   Mixed()},                   // kuch bhi: na cast, na validation
-    {"tags",    Array(String())},           // string ki list
-    {"scores",  Array(Number())},
-    {"address", Object(Schema({             // nested object
-        {"city", String()},
-        {"pin",  Int()},
-    }))},
-    {"items",   Array(Schema({              // sub-documents ki list
-        {"sku", String().required()},
-        {"qty", Int().def(1)},
-    }))},
-});
-
-s.add("nickname", String());                // baad me field jodna
-s.add(otherSchema);                         // dusre schema ke saare fields jodna
-```
-
-**Field ke saare options** (sab chain hote hain):
-
-| Option | Kaam |
+| Need | Write |
 |---|---|
-| `.required()` / `.required(true, "message")` | hona zaroori |
-| `.def(value)` / `.def([] { return Value(...); })` | default value / default function |
-| `.enumOf({"a", "b"})` | sirf inme se ek |
-| `.min(n)` `.max(n)` | number ki had |
-| `.minLength(n)` `.maxLength(n)` | string ki lambai |
-| `.match("regex", "message")` | string pattern |
-| `.validate(fn, "message")` | apna validator |
-| `.trim()` `.lowercase()` `.uppercase()` | string saaf karna |
-| `.set(fn)` | setter: save se pehle value badlo |
-| `.unique()` | unique index |
-| `.index()` | normal index |
-| `.select(false)` | find me by default nahi aata |
-| `.immutable()` | ek baar save ke baad badalta nahi |
-| `.ref("Model")` | `populate()` ke liye |
+| object | `{{"k", 1}, {"k2", "x"}}` or `Value::object()` |
+| array | `Value::array({1, 2, 3})` (always an array) |
+| date | `Date::now()`, `Date::parse("2026-01-31T10:20:30+05:30")` (validates calendar dates) |
+| ObjectId | `ObjectId::generate()`, `ObjectId("665f...")`, `ObjectId::isValid(s)` |
+| type checks | `isNull() isBool() isInt() isDouble() isNumber() isString() isDate() isObjectId() isArray() isObject()` |
+| lenient getters | `asBool() asInt() asDouble() asString() str() asDate() asObjectId()` |
+| typed | `v.as<int>()`, `v.as<std::vector<std::string>>()`, `v.as<std::map<std::string, double>>()`, `v.as<MyStruct>()` |
+
+> A brace list whose items are all `{"string", value}` pairs is an object. For an *array* of such pairs use
+> `Value::array({...})`.
 
 ---
 
-## 7. Validation
-
-`save()`, `create()`, `insertMany()` se pehle apne aap chalta hai. Khud chalana ho to `doc.validate()`.
+## Schemas and field types
 
 ```cpp
-Schema s({
-    {"name",  String().required().minLength(2).maxLength(30)},
-    {"email", String().required().match("^[^@]+@[^@]+\\.[a-z]+$", "email galat hai")},
-    {"age",   Int().min(0).max(150)},
-    {"role",  String().enumOf({"user", "admin"})},
-    {"pin",   Int().validate([](const Value &v) { return v.asInt() >= 100000 && v.asInt() <= 999999; },
-                             "pin 6 digit ka hona chahiye")},
-    {"phone", String().required(true, "phone number do")},
-});
-auto User = model("User", s);
+Schema productSchema({
+    {"title",    String().required().trim().maxLength(120)},
+    {"price",    Number().min(0)},
+    {"stock",    Int().def(0)},
+    {"active",   Boolean().def(true)},
+    {"launched", DateTime()},
+    {"shop",     Id().ref("Shop")},                         // ObjectId reference (populate)
+    {"tags",     Array(String().lowercase())},
+    {"variants", Array(Schema({{"sku", String().required()}, {"qty", Int().min(0)}}))},
+    {"dims",     Object(Schema({{"w", Number()}, {"h", Number()}}))},
+    {"prices",   Map(Number().min(0))},                     // {"inr": 499, "usd": 6}
+    {"extra",    Mixed()},                                  // anything, no casting
+}, {.timestamps = true});
+```
 
+| Type | Stores | Cast from |
+|---|---|---|
+| `String()` | string | numbers, bools, dates, ObjectIds |
+| `Number()` | int or double | numeric strings (`"12.5"`), bools |
+| `Int()` | int64 | whole numbers, `"42"`, `3.0` (rejects `3.5`) |
+| `Boolean()` | bool | `"true"/"false"`, `"1"/"0"`, `"yes"/"no"`, 0/1 |
+| `DateTime()` | Date | ISO strings, epoch milliseconds |
+| `Id()` | ObjectId | 24-character hex strings |
+| `Array(Field)` | array of a type | a single value becomes a one-item array |
+| `Array(Schema)` | array of sub-documents | objects |
+| `Object(Schema)` | nested sub-document | object |
+| `Map(Field)` | object with any keys, each value cast to `Field` | object |
+| `Mixed()` | anything | — |
+
+Field options (all chainable):
+
+| Option | Meaning |
+|---|---|
+| `required(true, "msg")` | must be present and not null/empty string |
+| `def(value)` / `def([]{ return ...; })` | default value / default function |
+| `enumOf({...}, "msg")` | allowed values |
+| `min(n, "msg")`, `max(n, "msg")` | numbers; also `min(Date)`, `max(Date)` for dates |
+| `minLength(n, "msg")`, `maxLength(n, "msg")` | string length |
+| `match("regex", "msg")` | ECMAScript regex, compiled once (an invalid regex throws immediately) |
+| `trim()`, `lowercase()`, `uppercase()` | string transforms |
+| `validate(fn, "msg")` | custom validator `bool(const Value&)` (several allowed; an exception counts as failure) |
+| `set(fn)` | setter: transform before storing |
+| `get(fn)` | getter: transform when reading with `doc.get()` / `toJSON()` (with `getters` option) |
+| `alias("n")` | alternative name usable in `get/set`, filters, updates and `select` |
+| `unique()`, `index()`, `sparse()`, `expires(seconds)` | indexes (see [Indexes](#indexes)) |
+| `select(false)` | hidden from queries unless requested with `"+field"` |
+| `immutable()` | cannot change after the first save (also stripped from updates) |
+| `ref("Model")` | for `populate()` |
+
+Messages can use `{PATH}` and `{VALUE}` placeholders: `Int().min(18, "{PATH} must be 18+, got {VALUE}")`.
+
+Schemas can be extended: `schema.add("field", Field)`, `schema.add(otherSchema)`, `schema.remove("field")`.
+
+---
+
+## Validation
+
+Validation runs automatically on `save()` / `create()` / `insertMany()` (and on updates with
+`{.runValidators = true}`). Call `doc.validate()` yourself if you want.
+
+```cpp
 try {
-    User.create({{"name", "A"}, {"email", "galat"}, {"age", 200}, {"role", "raja"}, {"pin", 12}});
+    User.create({{"name", "A"}, {"email", "bad"}, {"age", "abc"}});
 } catch (const ValidationError &e) {
-    std::cout << e.what() << "\n";
-    // User validation failed: age: Path `age` (200) is more than maximum allowed value (150)., email: email galat hai, ...
-
-    for (const auto &[path, message] : e.errors)      // har field ka alag error
-        std::cout << path << " -> " << message << "\n";
-
-    if (e.errors.count("email")) { /* form me email ke neeche dikhao */ }
+    e.what();                    // "User validation failed: age: ..., email: ..., name: ..."
+    e.errors.at("email");        // message per path
+    e.kinds.at("age");           // "cast"
+    e.kinds.at("name");          // "minlength"
 }
 ```
 
-- Saare errors ek saath milte hain (pehle par ruk nahi jata).
-- Nested ke path dotted hote hain: `address.city`, `items.0.sku`.
-- Khaali (null / diya hi nahi) field par sirf `required` check hota hai; baaki validators tabhi chalte hain jab value ho.
-- `.unique()` validator **nahi** hai. Wo index hai; duplicate par save ke waqt `DuplicateKeyError` aata hai (section 25).
+`kinds` follow Mongoose: `required`, `enum`, `min`, `max`, `minlength`, `maxlength`, `regexp`,
+`user defined`, `cast`.
+
+Like Mongoose, a value that **cannot be cast** (`"abc"` for an `Int`) does not throw when you build or `set()` a
+document; it is reported by `validate()` / `save()` as a `ValidationError` with kind `"cast"`.
+Filters and updates with values that cannot be cast throw `CastError` immediately.
+
+Required fields inside a nested `Object(Schema)` are validated even when the whole object is missing.
 
 ---
 
-## 8. Defaults, setters, cast
+## Casting, defaults, setters, getters, aliases
 
 ```cpp
 Schema s({
-    {"role",    String().def("user")},
-    {"active",  Boolean().def(true)},
-    {"joined",  DateTime().def([] { return Value(Date::now()); })},   // har naye document par chalta hai
-    {"token",   String().def([] { return Value(uuid()); })},
-    {"email",   String().trim().lowercase()},
-    {"code",    String().uppercase()},
-    {"slug",    String().set([](const Value &v) { return Value("post-" + v.asString()); })},
-    {"age",     Int()},
-});
-auto T = model("Thing", s);
+    {"name",  String().trim().alias("n")},
+    {"slug",  String().set([](const Value &v) { return Value(slugify(v.asString())); })},
+    {"paise", Int().get([](const Value &v) { return Value(v.asDouble() / 100); })},   // stored in paise
+    {"code",  String().uppercase().def([] { return Value(randomCode()); })},
+}, {.getters = true});
 
-auto d = T({{"email", "  A@B.COM "}, {"code", "ab"}, {"slug", "hello"}, {"age", "24"}});
-d["email"].asString();   // "a@b.com"
-d["code"].asString();    // "AB"
-d["slug"].asString();    // "post-hello"
-d["age"].asInt();        // 24      <- string "24" apne aap int bana (cast)
-d["role"].asString();    // "user"  <- default
+auto doc = M({{"n", "  Asha  "}, {"paise", "1250"}});
+doc["name"];         // "Asha"     (raw stored value, alias resolved)
+doc.get("n");        // "Asha"
+doc["paise"];        // 1250       (raw)
+doc.get("paise");    // 12.5       (getter applied)
+doc.toJSON();        // getters applied because of {.getters = true}
 ```
 
-**Cast** (Mongoose jaisa): `"24"` → `24`, `"true"` → `true`, ISO string → `Date`, 24-hex string → `ObjectId`.
-Na ban paye to `CastError`:
-
-```cpp
-try {
-    T({{"age", "abc"}});
-} catch (const CastError &e) {
-    std::cout << e.what();   // Cast to Int failed for value "abc" at path `age`
-    std::cout << e.path;     // age
-}
-```
-
-Cast **filter aur update** me bhi hota hai: `User.find({{"age", "24"}})` aur `User.findById("6afb…")` seedha chalte hain.
+- Defaults are applied when a document is built and, for upserts, through `$setOnInsert`.
+- Setters run on build, `set()`, and updates.
+- `strict` (default on): paths that are not in the schema are dropped — from documents **and** from updates.
 
 ---
 
-## 9. Model + Document banana
+## Models and documents
 
 ```cpp
-auto User = model("User", userSchema);                  // collection "users"  (naam chhota + bahuvachan)
-auto Log  = model("Log", logSchema, "app_logs");        // collection ka naam khud do
-auto Same = model("User");                              // kahin aur se wahi model (naam se)
+auto User = model("User", userSchema);              // collection "users"
+auto Person = model("Person", personSchema);        // collection "people" (Mongoose-style pluralization)
+auto Log = model("Log", logSchema, "app_logs");     // explicit collection
+auto again = model("User");                         // look up a registered model
+modelNames();                                       // {"Log", "Person", "User"}
 
-User.name();             // "User"
-User.collectionName();   // "users"
+Document d = User({{"name", "Asha"}});   // new, not saved yet
+d.isNew();                              // true
+d.save();                               // insert
+auto created = User.create({{"name", "Ravi"}});          // build + validate + insert
+auto many = User.insertMany({{{"name", "A"}}, {{"name", "B"}}}, {.ordered = false});
+auto doc = User.hydrate(rawValueFromSomewhere);          // Value -> Document (isNew = false)
 ```
 
-Naam se collection: `User → users`, `Category → categories`, `Box → boxes`.
-
-**Banane ke 3 tarike:**
+Reading a document:
 
 ```cpp
-// 1) create: banao + validate + save, ek saath
-auto a = User.create({{"name", "Araham"}, {"email", "a@x.in"}});
-
-// 2) pehle memory me banao, baad me save
-auto b = User({{"name", "Ravi"}});
-b.set("email", "ravi@x.in");
-b.isNew();        // true
-b.save();
-b.isNew();        // false
-
-// 3) bahut saare ek saath (ek hi DB call)
-auto docs = User.insertMany({
-    {{"name", "Sita"},  {"email", "sita@x.in"}},
-    {{"name", "Mohan"}, {"email", "mohan@x.in"}},
-});
+doc["name"].asString();             // raw value, reference (null if missing)
+doc.get("name");                    // with virtuals, aliases and getters
+doc.get<int>("age");
+doc.has("address.city");
+doc.id();  doc._id();
+doc.toObject();  doc.toJSON();  doc.json(2);
+doc.as<UserRow>();                  // into a NEVLA_STRUCT
 ```
 
-Naye document ko `_id` (ObjectId) turant mil jaata hai, save se pehle bhi: `b.id()` (string) ya `b._id()` (Value).
-
-`insertMany` me koi ek bhi document validation me fail ho to kuch bhi insert nahi hota.
-
----
-
-## 10. Padhna: find / findOne / findById
+Changing a document:
 
 ```cpp
-// bahut saare
-std::vector<Document> all    = User.find().exec();
-std::vector<Document> admins = User.find({{"role", "admin"}}).exec();
-
-// ek
-std::optional<Document> u = User.findOne({{"email", "a@x.in"}}).exec();
-if (u) std::cout << (*u)["name"].asString();
-
-// id se (string ya ObjectId dono chalte hain)
-auto byId = User.findById("6afb9f7045827a9e0d061d21").exec();
-
-// na mile to exception
-Document must = User.findOne({{"email", "a@x.in"}}).orFail();   // NotFoundError
-
-// lean: Document nahi, sirf plain Value (tez; sirf padhna ho to)
-std::vector<Value>   rows = User.find().lean();
-std::optional<Value> row  = User.findOne({{"role", "admin"}}).lean();
-```
-
-**Document se value padhna:**
-
-```cpp
-Document d = User.findOne().orFail();
-
-d["name"].asString();                 // field
-d["address.city"].asString();         // dotted path
-d.get<int>("age");                    // seedha C++ type
-d.has("nickname");                    // hai aur null nahi
-d.id();                               // _id string me
-d.json(2);                            // poora document JSON text me
-d.toObject();                         // poora document Value me
-
-for (const auto &t : d["tags"].elements()) std::cout << t.asString();
-```
-
-**MongoDB ke operators** seedha filter me:
-
-```cpp
-User.find({{"age", {{"$gte", 18}, {"$lt", 60}}}}).exec();
-User.find({{"role", {{"$in", Value::array({"admin", "mod"})}}}}).exec();
-User.find({{"$or", Value::array({ {{"age", {{"$lt", 18}}}}, {{"role", "admin"}} })}}).exec();
-User.find({{"tags", "iot"}}).exec();                 // array me "iot" ho
-User.find({{"address.city", "Durgapur"}}).exec();    // nested field
+doc.set("age", 25);                         // cast + setter + change tracking
+doc.set({{"age", 26}, {"role", "admin"}});
+doc.unset("nickname");
+doc.push("tags", "cpp");
+doc.mut("address").pathRef("city") = "Kolkata";   // in-place edit (marks the path modified)
+doc.markModified("extra");
+doc.overwrite({{"name", "New"}});           // replace every field (keeps _id, version, createdAt)
+doc.isModified("age");  doc.modifiedPaths();
+doc.save();                                 // $set / $unset of changed paths only
+doc.updateOne({{"$inc", {{"visits", 1}}}}); // Model.updateOne({_id}, ...)
+doc.deleteOne();
+doc.equals(other);                          // same _id
 ```
 
 ---
 
-## 11. Query builder
-
-Filter object ki jagah chain bhi likh sakte ho. `find()` aur `findOne()` dono par chalta hai.
+## Querying
 
 ```cpp
-auto users = User.find()
-    .where("age").gte(18).lt(60)             // age >= 18 AND age < 60
+auto users = User.find({{"role", "admin"}}).exec();              // std::vector<Document>
+auto rows  = User.find().lean();                                 // std::vector<Value> (faster, read-only)
+auto one   = User.findOne({{"email", "a@x.in"}}).exec();         // std::optional<Document>
+auto byId  = User.findById("665f1c...").orFail();                // throws NotFoundError if missing
+```
+
+The query builder (all chainable):
+
+```cpp
+User.find()
+    .where("age").gte(18).lt(60)
     .where("role").in({"user", "admin"})
-    .where("name").regex("^a", "i")          // "a" se shuru, case-insensitive
-    .where("email").exists()
-    .where("city", "Durgapur")               // where(path, value) = barabar
-    .sort("-age name")                       // age ghatte kram me, phir name
-    .skip(20)
-    .limit(10)
-    .select("name email age")                // sirf ye fields
+    .where("tags").all({"iot", "cpp"})
+    .where("tags").size(2)
+    .where("email").regex("@example\\.com$", "i")
+    .where("deletedAt").exists(false)
+    .where({{"active", true}})                      // or an object of conditions
+    .or_({{{"plan", "pro"}}, {{"credits", {{"$gt", 0}}}}})
+    .sort("-createdAt name")                        // or {{"createdAt", -1}}
+    .skip(20).limit(10)
+    .select("name email -_id")                      // "-password", "+secret" (select(false) field)
+    .populate("company")
+    .collation({{"locale", "en"}, {"strength", 2}}) // case-insensitive
+    .hint("email_1").maxTimeMS(2000).batchSize(100).comment("admin list")
     .exec();
+
+User.where("age").gte(18).count();                  // model-level where()
 ```
 
 | Method | MongoDB |
 |---|---|
-| `.where("f").equals(v)` / `.where("f", v)` | `{f: v}` |
-| `.gt(v)` `.gte(v)` `.lt(v)` `.lte(v)` `.ne(v)` | `$gt` `$gte` `$lt` `$lte` `$ne` |
-| `.in({...})` `.nin({...})` | `$in` `$nin` |
-| `.exists()` / `.exists(false)` | `$exists` |
-| `.regex("pattern", "i")` | `$regex` + `$options` |
-| `.sort("-age name")` / `.sort({{"age", -1}})` | sort |
-| `.skip(n)` `.limit(n)` | pagination |
-| `.select("a b")` / `.select("-a -b")` / `.select("+hidden")` | projection |
-| `.populate("path")` | section 17 |
-| `.count()` | kitne match hue |
+| `equals gt gte lt lte ne in nin all size mod exists regex elemMatch` | same-named operators |
+| `or_ and_ nor` | `$or $and $nor` (`or`/`and` are C++ keywords) |
+| `text("words")` | `$text` (needs a text index) |
 
-**select:**
+Filters are cast with the schema: `{{"age", "18"}}` becomes `18`, `{{"_id", "665f..."}}` becomes an `ObjectId`,
+`$in` arrays, `$elemMatch` on sub-document arrays and aliases are handled too.
+
+---
+
+## Cursors and pagination
 
 ```cpp
-User.find().select("name email").exec();     // sirf name, email (+ _id)
-User.find().select("-password -__v").exec(); // ye chhod ke sab
-User.findOne().select("+password").exec();   // select(false) wala field bhi lao
-```
+// Stream huge result sets without loading them into memory
+auto cur = Log.find({{"level", "error"}}).sort("-at").batchSize(500).cursor();
+while (auto doc = cur.next()) process(*doc);           // or cur.nextLean() for Values
 
-**Pagination:**
+Log.find().forEach([](Document &d) { /* ... */ });
 
-```cpp
-int page = 3, perPage = 20;
-auto rows  = User.find({{"role", "user"}}).sort("-createdAt").skip((page - 1) * perPage).limit(perPage).lean();
-auto total = User.countDocuments({{"role", "user"}});
+// Pagination
+Page p = Post.find({{"published", true}}).sort("-createdAt").paginate(/*page*/ 2, /*perPage*/ 20);
+p.docs;  p.total;  p.page;  p.pages;  p.hasNext;  p.hasPrev;
 ```
 
 ---
 
-## 12. Document badalna + save()
+## Updating
 
 ```cpp
-auto u = User.findOne({{"email", "a@x.in"}}).orFail();
+User.updateOne({{"_id", id}}, {{"name", "Asha"}});                   // plain fields -> $set
+User.updateOne({{"_id", id}}, {{"$inc", {{"visits", 1}}}, {"$push", {{"tags", "new"}}}});
+User.updateMany({{"role", "guest"}}, {{"active", false}});
+User.updateOne({{"email", "x@y.z"}}, {{"name", "X"}}, {.upsert = true, .runValidators = true});
 
-u.set("age", 25);                              // ek field
-u.set("address.city", "Burdwan");              // nested
-u.set({{"name", "Araham A."}, {"role", "admin"}});   // kai ek saath
-u.push("tags", "esp32");                       // array me jodna
-u.unset("nickname");                           // field hatana
-u.set("age", 26).set("role", "user").save();   // chain
-
-u.save();
+auto after = User.findOneAndUpdate({{"_id", id}}, {{"$inc", {{"n", 1}}}},
+                                   {.returnNew = true, .select = "n"});
+User.findByIdAndUpdate(id, {{"role", "admin"}});
+User.replaceOne({{"_id", id}}, {{"name", "Only this"}, {"email", "a@b.c"}});
+User.findOneAndReplace({{"_id", id}}, replacement, {.returnNew = true});
 ```
 
-`save()` sirf **badle hue fields** bhejta hai (`$set` / `$unset`), poora document nahi. Isse do jagah se alag-alag field badle to ek dusre ko nahi mitate.
+What nevla does to every update (Mongoose behaviour):
 
-```cpp
-u.isModified();               // kuch bhi badla?
-u.isModified("age");          // ye field badla?
-u.modifiedPaths();            // {"age", "address.city"}
-```
+- plain keys are wrapped in `$set`; aliases are resolved;
+- values are cast for `$set`, `$setOnInsert`, `$min`, `$max`, `$inc`, `$mul`, `$push`, `$addToSet`, `$pull`,
+  `$pullAll` — including positional paths like `items.$.qty`, `items.$[].qty`, `items.0.qty` and map keys;
+- unknown paths are removed (`strict`), `immutable` fields are removed (or moved to `$setOnInsert` on upsert);
+- `$inc` / `$mul` on a non-number path throws `CastError`;
+- `runValidators`: validators for `$set` / `$setOnInsert`, `required` for `$unset`;
+- `timestamps`: `updatedAt` is set, `createdAt` is never changed by an update and is set on upsert;
+- upserts get schema defaults and the discriminator key through `$setOnInsert`.
 
-**Mixed ya gehre data ko seedha badalna:** `mut()` reference deta hai aur path ko modified mark kar deta hai.
-
-```cpp
-u.mut("extra")["theme"] = "dark";
-u.mut("tags").push_back("new");
-u.save();
-```
-
-**Dhyan do:**
-
-- `set()` cast aur setters chalata hai (`set("age", "25")` → int 25). Cast na ho to `CastError`.
-- `strict` schema me jo field schema me nahi hai, `set()` use chupchaap chhod deta hai.
-- `.immutable()` field save ho chuke document me badalta nahi.
-- `save()` pehle validate karta hai. Fail ho to `ValidationError`, DB me kuch nahi jaata.
-- Document DB se delete ho chuka ho to `save()` par `NotFoundError`.
+`UpdateResult` = `{matchedCount, modifiedCount, upsertedId}`.
 
 ---
 
-## 13. Seedha update
-
-Document load kiye bina, ek hi DB call. Counter, status, bulk kaam ke liye ye behtar hai (atomic).
+## Deleting
 
 ```cpp
-// operator na do to apne aap $set ban jaata hai
-User.updateOne({{"email", "a@x.in"}}, {{"age", 26}, {"role", "admin"}});
-
-// MongoDB operators
-User.updateOne({{"_id", id}}, {{"$inc", {{"loginCount", 1}}}});
-User.updateOne({{"_id", id}}, {{"$push", {{"tags", "new"}}}});
-User.updateOne({{"_id", id}}, {{"$addToSet", {{"tags", "unique"}}}});
-User.updateOne({{"_id", id}}, {{"$pull", {{"tags", "old"}}}});
-User.updateOne({{"_id", id}}, {{"$unset", {{"nickname", ""}}}});
-User.updateOne({{"_id", id}}, {{"$set", {{"address.city", "Asansol"}}}, {"$inc", {{"v", 1}}}});
-
-// bahut saare
-UpdateResult r = User.updateMany({{"role", "user"}}, {{"active", false}});
-r.matchedCount;     // kitne mile
-r.modifiedCount;    // kitne sach me badle
-
-// upsert: na ho to bana do (schema ke defaults + timestamps bhi lagte hain)
-auto res = User.updateOne({{"email", "new@x.in"}}, {{"name", "Naya"}}, {.upsert = true});
-if (!res.upsertedId.isNull()) std::cout << "naya bana: " << res.upsertedId.str();
-
-// update par bhi validators ($set ke values par)
-User.updateOne({{"_id", id}}, {{"age", -5}}, {.runValidators = true});   // ValidationError
-```
-
-**Update karke document wapas lena:**
-
-```cpp
-// purana document (update se pehle wala), Mongoose ke default jaisa
-auto before = User.findOneAndUpdate({{"email", "a@x.in"}}, {{"age", 27}});
-
-// naya document (update ke baad wala) = Mongoose ka { new: true }
-auto after = User.findOneAndUpdate({{"email", "a@x.in"}}, {{"age", 27}}, {.returnNew = true});
-
-auto byId = User.findByIdAndUpdate(id, {{"$inc", {{"points", 10}}}}, {.returnNew = true});
-
-// counter jaisa: na ho to banao, aur naya wala lautao
-auto c = Counter.findOneAndUpdate({{"_id", "orders"}}, {{"$inc", {{"seq", 1}}}}, {.returnNew = true, .upsert = true});
-```
-
-Na mile (aur upsert na ho) to `std::nullopt`.
-
-`timestamps` on ho to har update par `updatedAt` apne aap badalta hai.
-
----
-
-## 14. Delete
-
-```cpp
-u.deleteOne();                                        // ye document
-
-int64_t n1 = User.deleteOne({{"email", "a@x.in"}});   // pehla match   -> 0 ya 1
-int64_t n2 = User.deleteMany({{"active", false}});    // saare match
-int64_t n3 = User.deleteMany();                       // SAB (dhyan se!)
-
-auto gone  = User.findOneAndDelete({{"email", "a@x.in"}});   // delete + wo document wapas
-auto gone2 = User.findByIdAndDelete(id);
-
-User.dropCollection();                                // poori collection + indexes
+User.deleteOne({{"email", "a@x.in"}});       // returns deleted count
+User.deleteMany({{"active", false}});
+User.findOneAndDelete({{"_id", id}});        // std::optional<Document>
+User.findByIdAndDelete(id);
+doc.deleteOne();                             // runs deleteOne document hooks
 ```
 
 ---
 
-## 15. count / exists / distinct / aggregate
+## Bulk writes
+
+Operations use the same shape as Mongoose's `Model.bulkWrite()`:
 
 ```cpp
-int64_t total  = User.countDocuments();
-int64_t admins = User.countDocuments({{"role", "admin"}});
-int64_t quick  = User.estimatedDocumentCount();          // tez, andaaze se (metadata se)
-int64_t viaQ   = User.find().where("age").gte(18).count();
+auto r = Product.bulkWrite({
+    {{"insertOne",  {{"document", {{"sku", "A1"}, {"qty", 5}}}}}},
+    {{"updateOne",  {{"filter", {{"sku", "B2"}}}, {"update", {{"$inc", {{"qty", 1}}}}}, {"upsert", true}}}},
+    {{"updateMany", {{"filter", {{"qty", 0}}}, {"update", {{"soldOut", true}}}}}},
+    {{"replaceOne", {{"filter", {{"sku", "C3"}}}, {"replacement", {{"sku", "C3"}, {"qty", 1}}}}}},
+    {{"deleteOne",  {{"filter", {{"sku", "D4"}}}}}},
+    {{"deleteMany", {{"filter", {{"discontinued", true}}}}}},
+}, /*ordered*/ true);
+r.insertedCount; r.matchedCount; r.modifiedCount; r.deletedCount; r.upsertedCount;
+```
 
-bool taken = User.exists({{"email", "a@x.in"}});
+Inserted documents are validated; updates and filters are cast exactly like `updateOne()`.
 
-std::vector<Value> roles  = User.distinct("role");
-std::vector<Value> cities = User.distinct("address.city", {{"active", true}});
+---
 
-// aggregate: pipeline = stages ka array, result plain Values
-auto stats = User.aggregate(Value::array({
-    {{"$match", {{"active", true}}}},
-    {{"$group", {{"_id", "$role"}, {"count", {{"$sum", 1}}}, {"avgAge", {{"$avg", "$age"}}}}}},
-    {{"$sort",  {{"count", -1}}}},
+## Aggregation, distinct, counting
+
+```cpp
+auto stats = Order.aggregate(Value::array({
+    {{"$match", {{"status", "paid"}}}},
+    {{"$group", {{"_id", "$customer"}, {"total", {{"$sum", "$amount"}}}}}},
+    {{"$sort", {{"total", -1}}}},
 }));
-for (const auto &row : stats)
-    std::cout << row["_id"].asString() << ": " << row["count"].asInt() << ", avg " << row["avgAge"].asDouble() << "\n";
+
+Order.countDocuments({{"status", "paid"}});
+Order.find({{"status", "paid"}}).count();
+Order.estimatedDocumentCount();
+Order.exists({{"_id", id}});
+Order.distinct("customer", {{"status", "paid"}});
+Order.find({{"status", "paid"}}).distinct("customer");
 ```
 
-> `aggregate` ke stages jaise ke taise MongoDB ko jaate hain (schema cast nahi hota), Mongoose ki tarah.
+Aggregation pipelines are not cast (same as Mongoose). Discriminator models prepend a `$match` on their type.
 
 ---
 
-## 16. Nested object + sub-document array
+## Sub-documents, arrays and maps
 
 ```cpp
 Schema orderSchema({
-    {"customer", String().required()},
-    {"address",  Object(Schema({
-        {"city", String().required()},
-        {"pin",  Int()},
-    }))},
-    {"items",    Array(Schema({
-        {"sku",   String().required()},
-        {"qty",   Int().def(1).min(1)},
-        {"price", Number().required()},
-    }))},
-});
-auto Order = model("Order", orderSchema);
-
-auto o = Order.create({
-    {"customer", "Araham"},
-    {"address",  {{"city", "Durgapur"}, {"pin", 713209}}},
-    {"items",    Value::array({
-        {{"sku", "ESP32"}, {"price", 450}},               // qty default 1
-        {{"sku", "DHT22"}, {"qty", 2}, {"price", 180}},
-    })},
+    {"items",   Array(Schema({{"sku", String().required()}, {"qty", Int().def(1).min(1)}}))},
+    {"address", Object(Schema({{"city", String().required()}, {"pin", Int()}}))},
+    {"stock",   Map(Int().min(0))},
 });
 
-o["address.city"].asString();                    // "Durgapur"
-o["items"].at(0)["qty"].asInt();                 // 1
-o["items.1.sku"].asString();                     // "DHT22"
+auto o = Order({{"items", Value::array({{{"sku", "A"}}})}, {"address", {{"city", "Kolkata"}}},
+                {"stock", {{"dgp", 4}, {"kol", "2"}}}});
+o["items"].at(0)["qty"];     // 1 (sub-document default)
+o["stock.kol"];              // 2 (cast)
+o.push("items", {{"sku", "B"}, {"qty", 3}});
+o.set("address.pin", "700001");
 
-o.push("items", {{"sku", "OLED"}, {"price", 220}});   // cast + default ke saath
-o.set("address.pin", 713402);
-o.set("items.0.qty", 5);
-o.save();
-
-double total = 0;
-for (const auto &it : o["items"].elements()) total += it["qty"].asInt() * it["price"].asDouble();
-
-Order.find({{"items.sku", "ESP32"}}).exec();                      // kisi bhi item me
-Order.updateOne({{"_id", o._id()}}, {{"$push", {{"items", {{"sku", "LED"}, {"price", 5}}}}}});
+Order.updateOne({{"items.sku", "A"}}, {{"$set", {{"items.$.qty", "5"}}}});   // positional, cast to 5
 ```
 
-- Nested ke errors: `address.city`, `items.1.price`.
-- `Object(Schema)` ke andar ka `required` field tab bhi zaroori hai jab poora nested object diya hi na ho (Mongoose ke nested path jaisa).
-- Sub-documents ko apna `_id` **nahi** milta (Mongoose deta hai). Chahiye to schema me khud field rakho.
+Map keys must not be empty, start with `$` or contain `.`.
 
 ---
 
-## 17. populate (ref)
-
-Ek document me dusre ki `_id` rakho, padhte waqt poora document mangwa lo.
+## Populate
 
 ```cpp
-auto Author = model("Author", Schema({{"name", String().required()}}));
-auto Tag    = model("Tag",    Schema({{"label", String()}}));
-auto Post   = model("Post",   Schema({
-    {"title",    String().required()},
-    {"author",   Id().ref("Author")},                      // ek
-    {"tags",     Array(Id().ref("Tag"))},                  // list
-    {"comments", Array(Schema({
-        {"by",   Id().ref("Author")},                      // sub-document ke andar
-        {"text", String()},
-    }))},
-}));
-
-auto prem = Author.create({{"name", "Premchand"}});
-auto t1   = Tag.create({{"label", "hindi"}});
-auto post = Post.create({
-    {"title", "Godaan"},
-    {"author", prem._id()},                                // ya prem.id() string, cast ho jaata hai
-    {"tags", Value::array({t1._id()})},
-    {"comments", Value::array({ {{"by", prem._id()}, {"text", "Dhanyavaad"}} })},
+Schema postSchema({
+    {"title",    String()},
+    {"author",   Id().ref("Author")},
+    {"tags",     Array(Id().ref("Tag"))},
+    {"comments", Array(Schema({{"by", Id().ref("Author")}, {"text", String()}}))},
 });
 
-// query ke saath
-auto posts = Post.find().populate("author").populate("tags").populate("comments.by").exec();
-for (auto &p : posts) {
-    std::cout << p["title"].asString() << " by " << p["author.name"].asString() << "\n";
-    for (const auto &t : p["tags"].elements())     std::cout << "  #" << t["label"].asString() << "\n";
-    for (const auto &c : p["comments"].elements()) std::cout << "  " << c["by"]["name"].asString() << ": " << c["text"].asString() << "\n";
-}
-
-// ek document par, baad me
-auto one = Post.findById(post._id()).orFail();
-one["author"].isObjectId();     // true  (abhi sirf id)
-one.populate("author");
-one["author"]["name"].asString();
-
-// lean ke saath bhi
-auto rows = Post.find().populate("author").lean();
+Post.find().populate("author").populate("tags").populate("comments.by").exec();
+doc.populate("author");
+doc.populated("author");     // true
+doc.depopulate("author");    // back to the ObjectId
 ```
 
-- Chahe 1000 posts hon, har `populate` path ke liye **ek hi** extra query lagti hai (`$in`), har post ke liye alag nahi.
-- Ref wala document mil na paye to: akela field `null` ho jaata hai, list me se wo item hat jaata hai.
-- Ref model ke `select(false)` fields populate me bhi nahi aate.
-- Jis path par `.ref()` nahi hai uspe `populate()` → `Error`.
-- Populate ke baad us field ko wapas `save()` mat karo (wo ab object hai, id nahi). Padhne ke liye populate, badalne ke liye id.
+With options (select, match, sort, per-document limit, nested populate, model override):
+
+```cpp
+PopulateOptions author;
+author.path = "author";
+author.select = "name company";
+author.match = {{"active", true}};          // not matching -> null (arrays: dropped)
+PopulateOptions company;
+company.path = "company";
+author.populate.push_back(company);         // populate inside the populated author
+
+PopulateOptions tags;
+tags.path = "tags";
+tags.sort = "label";
+tags.limit = 3;
+
+Post.find().populate(author).populate(tags).exec();
+```
+
+**Virtual populate** (the "one-to-many from the other side"):
+
+```cpp
+Schema authorSchema({{"name", String()}});
+authorSchema.virtualPopulate("posts", {.ref = "Post", .localField = "_id", .foreignField = "author"});
+authorSchema.virtualPopulate("latestPost", {.ref = "Post", .localField = "_id", .foreignField = "author",
+                                            .justOne = true});
+
+auto a = Author.findById(id).populate("posts").orFail();
+a["posts"].size();
+```
+
+Saving a populated document stores ids, never the embedded documents.
 
 ---
 
-## 18. Hooks (middleware)
-
-**Document hooks:** `"validate"`, `"save"`, `"deleteOne"`
+## Middleware (hooks)
 
 ```cpp
-Schema s({{"email", String()}, {"password", String()}, {"slug", String()}, {"title", String()}});
+// Document middleware: "validate", "save", "deleteOne"
+userSchema.pre("save", [](Document &d) {
+    if (d.isModified("password")) d.set("password", hash(d["password"].asString()));
+});
+userSchema.post("save", [](Document &d) { audit("saved", d.id()); });
 
-s.pre("save", [](Document &doc) {
-    if (doc.isModified("password"))                       // sirf tab jab password badla ho
-        doc.set("password", myHash(doc["password"].asString()));
-    if (doc.isNew())
-        doc.set("slug", makeSlug(doc["title"].asString()));
+// Query middleware: "find", "findOne", "countDocuments", "updateOne", "updateMany", "replaceOne",
+// "findOneAndUpdate", "findOneAndReplace", "findOneAndDelete", "deleteOne", "deleteMany", "aggregate"
+userSchema.pre("find", [](QueryInfo &q) { q.filter["deletedAt"] = nullptr; });          // soft delete
+userSchema.pre("updateOne", [](QueryInfo &q) { (*q.update)["$set"]["touched"] = true; });
+userSchema.pre("aggregate", [](QueryInfo &q) {                                          // q.filter = pipeline
+    q.filter.push_back(Value{{"$limit", 1000}});
 });
 
-s.post("save", [](Document &doc) {
-    std::cout << "save hua: " << doc.id() << "\n";
-});
-
-s.pre("validate", [](Document &doc) { /* validation se pehle value theek karo */ });
-s.pre("deleteOne", [](Document &doc) { /* is document se jude doosre data hatao */ });
-s.post("deleteOne", [](Document &doc) { /* log */ });
+// post query hooks receive (and may change) the result
+userSchema.post("find", [](QueryInfo &q, Value &result) { metrics("find", result.size()); });
+userSchema.post("updateOne", [](QueryInfo &, Value &r) { log(r["modifiedCount"].asInt()); });
 ```
 
-`save()` ka kram: **pre validate → validation → post validate → pre save → DB → post save**
-
-Hook me exception feko to kaam wahin ruk jaata hai (DB me kuch nahi jaata):
-
-```cpp
-s.pre("save", [](Document &doc) {
-    if (doc["role"].asString() == "admin" && !doc.has("email")) throw Error("admin ke liye email zaroori hai");
-});
-```
-
-**Query hooks:** `"find"`, `"findOne"`, `"countDocuments"`, `"updateOne"`, `"updateMany"`, `"findOneAndUpdate"`, `"deleteOne"`, `"deleteMany"`, `"findOneAndDelete"`
-
-Inme filter (aur update) ko query chalne se pehle badal sakte ho:
-
-```cpp
-// Soft delete: deleted wale kabhi na dikhen
-for (const char *op : {"find", "findOne", "countDocuments"})
-    s.pre(op, [](QueryInfo &q) {
-        if (!q.filter.contains("deleted")) q.filter["deleted"] = false;
-    });
-
-// Har update par ek field
-s.pre("updateOne", [](QueryInfo &q) {
-    (*q.update)["$set"]["lastTouchedBy"] = "system";     // q.update sirf update wale ops me hota hai
-});
-
-// q.op = "find" / "updateOne" ...,  q.model = model ka naam
-```
-
-**Kaun kya chalata hai:**
-
-| Kaam | Hooks |
-|---|---|
-| `doc.save()`, `Model.create()` | validate + save |
-| `Model.insertMany()` | sirf validate |
-| `doc.deleteOne()` | deleteOne (document wala) |
-| `Model.find()` / `findOne()` / `findById()` | find / findOne (query wala) |
-| `Model.updateOne()` waghera | usi naam ka query hook; **save hooks nahi** |
-
-Hooks model banane (`model(...)`) se **pehle** schema par lagao.
+Post-hook results: an array (`find`, `aggregate`), a document or null (`findOne`, `findOneAnd*`), a count
+(`countDocuments`) or `{matchedCount, modifiedCount, upsertedId}` / `{deletedCount}` for writes.
 
 ---
 
-## 19. Virtuals, methods, toJSON
+## Virtuals, methods, statics, plugins, toJSON
 
 ```cpp
-Schema s({
-    {"first",    String()},
-    {"last",     String()},
-    {"password", String()},
-    {"born",     DateTime()},
-}, {.virtuals = true});                       // toJSON() me virtuals + "id" bhi aayen
-
-// Virtual: DB me save nahi hota, padhte waqt banta hai
-s.virtual_("fullName", [](const Document &d) {
+userSchema.virtual_("fullName", [](const Document &d) {
     return Value(d["first"].asString() + " " + d["last"].asString());
 });
+doc.get("fullName");
 
-// Method: document par apna function
-s.method("greet", [](Document &d, const Value &args) {
-    return Value(args["hello"].asString() + ", " + d["first"].asString() + "!");
+userSchema.method("isAdult", [](Document &d, const Value &) { return Value(d["age"].asInt() >= 18); });
+doc.call("isAdult");
+
+userSchema.static_("findByEmail", [](const Model &M, const Value &email) {
+    auto d = M.findOne({{"email", email}}).lean();
+    return d ? *d : Value();
 });
-s.method("promote", [](Document &d, const Value &) {
-    d.set("role", "admin").save();
-    return Value(true);
-});
+User.call("findByEmail", "a@x.in");
 
-// toJSON transform: API me bhejne se pehle saaf karo
-s.toJSON([](const Document &, Value &out) {
-    out.erase("password");
-    out.erase("__v");
-});
+// Plugins: reusable schema features
+void timestampsPlugin(Schema &s) { /* add fields, hooks, methods ... */ }
+void softDelete(Schema &s, const Value &opts) { s.add(opts["field"].asString(), DateTime()); }
+userSchema.plugin(timestampsPlugin);
+userSchema.plugin(softDelete, {{"field", "deletedAt"}});
 
-auto Person = model("Person", s);
-auto p = Person.create({{"first", "Araham"}, {"last", "Abeddin"}, {"password", "x"}});
-
-p["fullName"].asString();                                // "Araham Abeddin"
-p.call("greet", {{"hello", "Namaste"}}).asString();      // "Namaste, Araham!"
-p.call("promote");
-
-p.toJSON();     // Value: virtuals + id ke saath, password / __v ke bina
-p.json();       // wahi, JSON text me   <- HTTP response me ye bhejo
-p.toObject();   // kaccha data, jaisa DB me hai
+// toJSON transform
+userSchema.toJSON([](const Document &, Value &out) { out.erase("password"); });
 ```
 
-**Static** (model-level) function ke liye C++ me alag cheez nahi chahiye, seedha function likho:
-
-```cpp
-std::optional<Document> findByEmail(const std::string &email) {
-    return model("User").findOne({{"email", email}}).exec();
-}
-```
+`virtual` is a C++ keyword, hence `virtual_`; `static` likewise, hence `static_`.
+With `{.virtuals = true}` `toJSON()` also includes virtuals, aliases and `id`.
 
 ---
 
-## 20. Indexes
+## Indexes
 
 ```cpp
-Schema s({
-    {"email",  String().unique()},          // unique index
-    {"owner",  String().index()},           // normal index
-    {"device", String()},
-    {"at",     DateTime()},
-    {"loc",    Mixed()},
-});
+{"email",    String().unique()}
+{"phone",    String().unique().sparse()}             // unique only when present
+{"city",     String().index()}
+{"expireAt", DateTime().expires(0)}                  // TTL index (seconds)
 
-s.index({{"device", 1}, {"at", -1}});                                   // compound
-s.index({{"owner", 1}, {"email", 1}}, {{"unique", true}});              // compound unique
-s.index({{"at", 1}}, {{"expireAfterSeconds", 7 * 24 * 3600}});          // TTL: 7 din baad apne aap delete
-s.index({{"loc", "2dsphere"}});                                         // geo
-s.index({{"title", "text"}});                                           // text search
-s.index({{"email", 1}}, {{"sparse", true}, {"name", "email_sparse"}});  // MongoDB ke koi bhi index options
+schema.index({{"userId", 1}, {"createdAt", -1}});                  // compound
+schema.index({{"title", "text"}, {"body", "text"}});               // text
+schema.index({{"at", 1}}, {{"expireAfterSeconds", 7 * 24 * 3600}});
 ```
 
-- Indexes model ke **pehle DB operation** par apne aap ban jaate hain (`autoIndex`).
-- Production me khud control chahiye to: `{.autoIndex = false}` rakho aur deploy ke waqt `User.createIndexes();` bulao.
-- Nested schema ke `.index()` / `.unique()` bhi bante hain (`address.pin` jaise).
+- With `autoIndex` (default) indexes are created before the model's first operation. If that fails (for example
+  duplicates already exist for a new unique index) **the model keeps working**; the error goes to the
+  `onIndexError` handler (stderr by default):
+
+  ```cpp
+  nevla::onIndexError([](const std::string &model, const std::string &msg) { log.warn(model, msg); });
+  ```
+
+- `Model.createIndexes()` creates them now and throws on failure.
+- `Model.syncIndexes()` creates missing indexes and drops indexes that are no longer in the schema.
+- `Model.listIndexes()` returns the collection's indexes.
 
 ---
 
-## 21. Custom `_id`
-
-By default `_id` ObjectId hota hai. Apna chahiye to schema me `_id` likh do:
+## Custom `_id`
 
 ```cpp
-// String key
-auto Setting = model("Setting", Schema({
-    {"_id",   String()},
-    {"value", Mixed()},
-}));
-Setting.create({{"_id", "theme"}, {"value", {{"dark", true}}}});
-auto theme = Setting.findById("theme").orFail();
-Setting.updateOne({{"_id", "lang"}}, {{"value", "hi"}}, {.upsert = true});
+auto Setting = model("Setting", Schema({{"_id", String()}, {"value", Mixed()}}, {.versionKey = ""}));
+Setting.create({{"_id", "theme"}, {"value", "dark"}});
 
-// UUID apne aap
-auto Device = model("Device", Schema({
-    {"_id",  String().def([] { return Value(uuid()); })},
-    {"name", String()},
-}));
-auto d = Device.create({{"name", "ESP32"}});
-d.id();     // "6220f7dd-8fd1-4d29-8a6b-5aa145479403"
-
-// Number
-auto Seq = model("Seq", Schema({{"_id", Int()}, {"label", String()}}));
-Seq.create({{"_id", 1}, {"label", "pehla"}});
+auto Device = model("Device", Schema({{"_id", String().def([] { return Value(uuid()); })}, {"name", String()}}));
 ```
 
-Same `_id` dobara daalo to `DuplicateKeyError`.
+Without an `_id` field the schema uses an auto-generated `ObjectId`; 24-hex strings in filters are cast.
 
 ---
 
-## 22. Discriminators
+## Discriminators
 
-Ek hi collection me alag-alag "type" ke documents, har type ke apne extra fields.
+Several document types in one collection (Mongoose discriminators):
 
 ```cpp
-auto Device = model("Device", Schema({
-    {"name",   String().required()},
-    {"online", Boolean().def(false)},
-}));
+auto Device = model("Device", Schema({{"name", String().required()}, {"online", Boolean().def(false)}}));
 auto Sensor = Device.discriminator("Sensor", Schema({{"unit", String().required()}, {"value", Number()}}));
-auto Relay  = Device.discriminator("Relay",  Schema({{"channels", Int().def(1)}}));
+auto Relay  = Device.discriminator("Relay",  Schema({{"state", Boolean().def(false)}}));
 
-Sensor.create({{"name", "temp"}, {"unit", "C"}, {"value", 31.5}});   // devices collection me, __t: "Sensor"
-Relay.create({{"name", "pump"}, {"channels", 4}});
-Device.create({{"name", "generic"}});
-
-Sensor.find().exec();            // sirf sensors
-Relay.countDocuments();          // sirf relays
-Device.find().exec();            // SAB
-
-for (auto &d : Device.find().exec()) {
-    if (d.modelName() == "Sensor")      std::cout << d["value"].asDouble() << d["unit"].asString();
-    else if (d.modelName() == "Relay")  std::cout << d["channels"].asInt();
-}
+Sensor.create({{"name", "Temp"}, {"unit", "C"}});      // stored with __t: "Sensor"
+Sensor.find().exec();                                  // only sensors
+for (auto &d : Device.find().exec()) d.modelName();    // "Sensor" / "Relay": each cast with its own schema
 ```
-
-- Base model se find karo to bhi har document apne sahi type ka `Document` banta hai (uske schema se cast/validate hota hai).
-- Child model ke find / update / delete / count / aggregate me type ka filter apne aap lagta hai.
-- Type wale field ka naam badalna ho: `{.discriminatorKey = "kind"}`.
-- Discriminators model banane ke turant baad, DB use karne se pehle register karo.
 
 ---
 
-## 23. Transactions
+## Versioning and optimistic concurrency
 
-Kai kaam ek saath: ya sab honge, ya koi nahi.
+The version key (`__v`, configurable or `""` to disable) starts at 0 and is incremented when an array path
+is saved or when you call `doc.increment()`.
+
+With `{.optimisticConcurrency = true}` every `save()` checks the version it loaded:
 
 ```cpp
-transaction([&] {
-    Account.updateOne({{"owner", "a"}}, {{"$inc", {{"balance", -500}}}});
-    Account.updateOne({{"owner", "b"}}, {{"$inc", {{"balance",  500}}}});
-    Transfer.create({{"from", "a"}, {"to", "b"}, {"amount", 500}});
+Schema s({{"qty", Int()}}, {.optimisticConcurrency = true});
+auto a = Item.findById(id).orFail();
+auto b = Item.findById(id).orFail();
+a.set("qty", 2).save();
+b.set("qty", 3).save();      // throws VersionError: somebody else saved it meanwhile
+```
+
+`save()` of a document that was deleted meanwhile throws `NotFoundError`.
+
+---
+
+## Transactions
+
+Needs a replica set or Atlas.
+
+```cpp
+nevla::transaction([&] {
+    Account.updateOne({{"_id", from}}, {{"$inc", {{"balance", -100}}}}, {.runValidators = true});
+    Account.updateOne({{"_id", to}}, {{"$inc", {{"balance", 100}}}});
+    Ledger.create({{"from", from}, {"to", to}, {"amount", 100}});
 });
 ```
 
-Andar se koi bhi exception nikle to **sab rollback**, aur wahi exception bahar aata hai:
-
-```cpp
-try {
-    transaction([&] {
-        auto a = Account.findOne({{"owner", "a"}}).orFail();
-        if (a["balance"].asInt() < 500) throw Error("balance kam hai");
-        a.set("balance", a["balance"].asInt() - 500).save();
-        Account.updateOne({{"owner", "b"}}, {{"$inc", {{"balance", 500}}}});
-    });
-} catch (const Error &e) {
-    std::cout << "transfer nahi hua: " << e.what();
-}
-```
-
-- `transaction()` ke andar usi thread par nevla ke saare calls apne aap us transaction me chalte hain; session khud pass nahi karna.
-- MongoDB me transactions sirf **replica set / Atlas** par chalte hain. Akele `mongod` par `Error` aayega. Local test ke liye: `mongod --replSet rs0` chalao aur ek baar `mongosh --eval "rs.initiate()"`.
-- Network gadbad par driver transaction dobara chala sakta hai, isliye andar aisa kaam mat karo jo dobara hone par galat ho jaye (jaise email bhejna).
+- Every nevla call **on the same thread** inside the lambda uses the transaction automatically.
+- If the lambda throws, everything is rolled back and the exception is re-thrown.
+- The lambda may run more than once (the driver retries transient errors) — keep it free of side effects
+  outside the database.
+- Nested `transaction()` calls join the outer transaction.
 
 ---
 
-## 24. Typed struct: `NEVLA_STRUCT`
+## Change streams
 
-String keys ki jagah apna C++ struct chahiye? Ek macro se jod do.
+Needs a replica set or Atlas.
+
+```cpp
+auto stream = Order.watch(Value::array({{{"$match", {{"operationType", "insert"}}}}}),
+                          {.fullDocument = true, .maxAwaitMS = 1000});
+while (running) {
+    if (auto ev = stream.next())                         // nullopt = nothing within maxAwaitMS
+        notify((*ev)["fullDocument"]);
+}
+```
+
+---
+
+## Typed structs with `NEVLA_STRUCT`
 
 ```cpp
 struct Address {
@@ -1002,282 +808,192 @@ struct Address {
 NEVLA_STRUCT(Address, city, pin)
 
 struct Student {
-    std::string id;                       // "id" <-> MongoDB "_id"
+    std::string id;                        // "id" <-> MongoDB "_id"
     std::string name;
     int roll = 0;
     double cgpa = 0;
     std::vector<std::string> subjects;
-    std::optional<std::string> hostel;    // DB me na ho to nullopt
-    Address address;                      // nested struct
+    std::optional<std::string> hostel;     // nullopt when missing
+    std::map<std::string, int> marks;      // maps work too
+    Address address;                       // nested struct
     Date admitted;
 };
-NEVLA_STRUCT(Student, id, name, roll, cgpa, subjects, hostel, address, admitted)
+NEVLA_STRUCT(Student, id, name, roll, cgpa, subjects, hostel, marks, address, admitted)
+
+auto doc = StudentModel.create(toValue(s));      // struct -> validated document
+Student back = doc.as<Student>();                // document -> struct (id filled)
+for (auto &v : StudentModel.find().lean()) list.push_back(v.as<Student>());
+StudentModel.findById(back.id).orFail().set(toValue(back)).save();
 ```
 
-Macro struct ke **bahar, usi namespace me** likho.
-
-```cpp
-auto StudentModel = model("Student", studentSchema);
-
-// struct -> DB
-Student s;
-s.name = "Araham";  s.roll = 42;  s.cgpa = 8.7;
-s.subjects = {"DSP", "Embedded"};
-s.address = {"Durgapur", 713209};
-auto doc = StudentModel.create(toValue(s));     // schema validation ke saath
-
-// DB -> struct
-Student back = doc.as<Student>();               // back.id ab bhara hua hai
-Student one  = StudentModel.findById(back.id).orFail().as<Student>();
-
-std::vector<Student> toppers;
-for (auto &v : StudentModel.find().where("cgpa").gte(8).lean()) toppers.push_back(v.as<Student>());
-
-// struct ke badlav wapas DB me
-one.cgpa = 9.1;
-StudentModel.findById(one.id).orFail().set(toValue(one)).save();
-```
-
-- `id` naam ka member `_id` se judta hai. Khaali ho to bheja nahi jaata (DB khud banata hai).
-- Chalne wale member types: `std::string`, `bool`, saare int/float, `Date`, `ObjectId`, `Value`, `std::vector<T>`, `std::optional<T>`, aur koi bhi `NEVLA_STRUCT` wala struct.
-- Bina model/schema ke bhi chalta hai: `Value v = toValue(s);  Student s2 = v.as<Student>();`
-
-**Apna type jodna** (jaise enum): do function likho, usi namespace me.
-
-```cpp
-enum class Role { User, Admin };
-inline void to_value(nevla::Value &out, const Role &r) { out = (r == Role::Admin ? "admin" : "user"); }
-inline void from_value(const nevla::Value &v, Role &r) { r = (v.asString() == "admin" ? Role::Admin : Role::User); }
-```
+Write the macro outside the struct, in the same namespace. Add your own types with
+`to_value(Value&, const T&)` / `from_value(const Value&, T&)` overloads in the type's namespace.
 
 ---
 
-## 25. Errors
+## Errors
 
-Sab `nevla::Error` (jo `std::runtime_error` hai) se bante hain.
+All errors derive from `nevla::Error` (a `std::runtime_error`).
 
-| Error | Kab |
+| Error | When |
 |---|---|
-| `ValidationError` | schema validation fail. `.errors` = `map<path, message>` |
-| `CastError` | value sahi type me nahi badal payi. `.path` |
-| `DuplicateKeyError` | unique index / `_id` dobara (MongoDB E11000) |
-| `NotFoundError` | `orFail()` ko kuch nahi mila; `save()` ka document DB me nahi |
-| `Error` | baaki sab: connection, galat JSON, MongoDB ke doosre errors |
+| `ValidationError` | schema validation failed; `.errors` (path → message) and `.kinds` (path → kind) |
+| `CastError` | a filter / update value cannot be cast; `.path` |
+| `DuplicateKeyError` | unique index or duplicate `_id` (MongoDB E11000) |
+| `NotFoundError` | `orFail()` found nothing; `save()` on a document that no longer exists |
+| `VersionError` | `optimisticConcurrency` conflict on `save()` |
+| `Error` | everything else: not connected, bad JSON, server errors |
 
 ```cpp
 try {
     User.create(body);
-} catch (const ValidationError &e) {
-    // 400: e.errors me har field ka message
-} catch (const CastError &e) {
-    // 400: e.path wala field galat type ka hai
-} catch (const DuplicateKeyError &e) {
-    // 409: pehle se hai
-} catch (const NotFoundError &e) {
-    // 404
-} catch (const Error &e) {
-    // 500: e.what()
+} catch (const ValidationError &e) {      // 400
+} catch (const CastError &e) {            // 400
+} catch (const DuplicateKeyError &e) {    // 409
+} catch (const NotFoundError &e) {        // 404
+} catch (const VersionError &e) {         // 409
+} catch (const Error &e) {                // 500
 }
 ```
 
-Pehle chhote (derived) errors pakdo, `Error` sabse aakhir me.
+---
+
+## Threads, async and debugging
+
+- `Model` objects and the connection are **thread-safe**; use them from any number of threads.
+- A single `Document` object must not be modified by two threads at the same time.
+- All calls are blocking. Offload them with `nevla::async`:
+
+  ```cpp
+  auto fut = nevla::async([&] { return User.find({{"active", true}}).lean(); });
+  auto users = fut.get();
+  ```
+
+  In event-loop servers (Drogon, Boost.Asio, ...) run database calls on a worker pool, not on the loop thread.
+
+- Debug logging, like `mongoose.set('debug', true)`:
+
+  ```cpp
+  nevla::setDebug(true);     // prints "nevla: users.find({...})" to stderr
+  nevla::setDebug([](const std::string &coll, const std::string &op, const Value &args) { /* your logger */ });
+  nevla::setDebug(false);
+  ```
 
 ---
 
-## 26. Threads + async
-
-- nevla **thread-safe** hai: ek hi `Model` ko kai threads se ek saath use karo (andar connection pool hai).
-- Ek hi `Document` object ko do threads me ek saath mat badlo. Har thread apna document load kare.
-- Saare calls **blocking** hain (jawab aane tak rukte hain). Mongoose ki tarah `await` nahi hai.
-
-Blocking kaam ko alag thread par bhejna ho:
-
-```cpp
-auto fut = nevla::async([&] { return User.find({{"active", true}}).lean(); });
-// ... yahan doosra kaam ...
-std::vector<Value> users = fut.get();     // exception ho to yahan aata hai
-```
-
-Event-loop wale server (Drogon, Boost.Asio…) me DB call ko event-loop thread par seedha mat chalao; worker thread pool par bhejo, warna us dauran baaki requests rukti hain.
-
----
-
-## 27. Schema options
+## Schema options
 
 ```cpp
 Schema s({...}, {
-    .timestamps       = true,        // createdAt + updatedAt apne aap
-    .collection       = "my_coll",   // collection ka naam
-    .strict           = true,        // schema me na likhe fields chhod do (false = sab rakh lo)
-    .versionKey       = "__v",       // "" = band
-    .discriminatorKey = "__t",
-    .autoIndex        = true,        // pehle operation par indexes banao
-    .virtuals         = false,       // toJSON() me virtuals + "id"
+    .timestamps            = false,        // createdAt / updatedAt
+    .collection            = "",           // default: pluralized model name
+    .strict                = true,         // drop unknown paths in documents AND updates
+    .versionKey            = "__v",        // "" disables
+    .discriminatorKey      = "__t",
+    .autoIndex             = true,         // create indexes before the first operation
+    .virtuals              = false,        // toJSON(): virtuals, aliases, "id"
+    .createdAt             = "createdAt",  // timestamp field names
+    .updatedAt             = "updatedAt",
+    .optimisticConcurrency = false,        // VersionError on conflicting save()
+    .getters               = false,        // toJSON() applies field getters
 });
 ```
 
-Jo chahiye sirf wahi likho (kram yahi rakhna hai, C++ ka niyam): `{.timestamps = true, .virtuals = true}`.
-
-**timestamps:**
-
-```cpp
-auto p = Post.create({{"title", "x"}});
-p["createdAt"].asDate().iso();     // banne ka time (kabhi nahi badalta)
-p["updatedAt"].asDate().iso();     // har save() / update par naya
-Post.find().sort("-createdAt").exec();
-```
-
-**strict = false:**
-
-```cpp
-auto Loose = model("Loose", Schema({{"a", Int()}}, {.strict = false}));
-auto l = Loose.create({{"a", 1}, {"kuchBhi", {{"x", 1}}}});     // "kuchBhi" bhi save hoga
-l.set("aurBhi", "haan").save();
-```
+C++ designated initializers must keep this order; write only the ones you need:
+`{.timestamps = true, .virtuals = true}`.
 
 ---
 
-## 28. Mongoose ↔ nevla cheat-sheet
+## Mongoose → nevla cheat sheet
 
 | Mongoose (JavaScript) | nevla (C++) |
 |---|---|
-| `mongoose.connect(uri)` | `connect(uri, "db")` |
+| `mongoose.connect(uri)` | `connect(uri)` |
 | `new Schema({ name: { type: String, required: true } })` | `Schema({{"name", String().required()}})` |
-| `{ type: Number, min: 0, default: 1 }` | `Number().min(0).def(1)` |
-| `{ type: String, enum: ['a','b'] }` | `String().enumOf({"a", "b"})` |
-| `{ type: ObjectId, ref: 'User' }` | `Id().ref("User")` |
-| `[String]` | `Array(String())` |
-| `[{ sku: String }]` | `Array(Schema({{"sku", String()}}))` |
-| `Schema.Types.Mixed` | `Mixed()` |
-| `{ timestamps: true }` | `{.timestamps = true}` |
+| `{ type: [String] }` | `Array(String())` |
+| `{ type: Map, of: Number }` | `Map(Number())` |
 | `mongoose.model('User', schema)` | `model("User", schema)` |
 | `new User({...})` | `User({...})` |
 | `await User.create({...})` | `User.create({...})` |
-| `await User.find({ age: { $gte: 18 } })` | `User.find({{"age", {{"$gte", 18}}}}).exec()` |
-| `await User.findOne({...})` | `User.findOne({...}).exec()` |
-| `await User.findById(id)` | `User.findById(id).exec()` |
-| `.orFail()` | `.orFail()` |
+| `await User.find({...}).sort('-age').limit(5)` | `User.find({...}).sort("-age").limit(5).exec()` |
 | `.lean()` | `.lean()` |
-| `.where('age').gte(18).sort('-age').limit(10)` | `.where("age").gte(18).sort("-age").limit(10)` |
-| `.select('name -_id')` / `.select('+password')` | `.select("name -_id")` / `.select("+password")` |
-| `.populate('author')` | `.populate("author")` |
-| `doc.name` | `doc["name"].asString()` |
-| `doc.name = 'x'` | `doc.set("name", "x")` |
-| `doc.tags.push('a')` | `doc.push("tags", "a")` |
-| `doc.markModified('extra')` | `doc.markModified("extra")` ya `doc.mut("extra")` |
-| `doc.isModified('password')` | `doc.isModified("password")` |
-| `await doc.save()` | `doc.save()` |
-| `await doc.deleteOne()` | `doc.deleteOne()` |
+| `User.findById(id).orFail()` | `User.findById(id).orFail()` |
+| `doc.name = 'x'; await doc.save()` | `doc.set("name", "x").save()` |
+| `doc.name` | `doc["name"]` / `doc.get("name")` |
 | `User.updateOne(f, u, { upsert: true })` | `User.updateOne(f, u, {.upsert = true})` |
-| `findOneAndUpdate(f, u, { new: true })` | `findOneAndUpdate(f, u, {.returnNew = true})` |
-| `User.countDocuments(f)` | `User.countDocuments(f)` |
-| `User.exists(f)` | `User.exists(f)` |
-| `User.distinct('role')` | `User.distinct("role")` |
-| `User.aggregate([...])` | `User.aggregate(Value::array({...}))` |
+| `User.findOneAndUpdate(f, u, { new: true })` | `User.findOneAndUpdate(f, u, {.returnNew = true})` |
+| `.populate({ path, select, match, options: { sort, limit }, populate })` | `PopulateOptions{...}` |
 | `schema.pre('save', function () {...})` | `schema.pre("save", [](Document &d) {...})` |
+| `schema.post('find', function (docs) {...})` | `schema.post("find", [](QueryInfo &, Value &docs) {...})` |
 | `schema.virtual('x').get(fn)` | `schema.virtual_("x", fn)` |
-| `schema.methods.greet = fn` / `doc.greet()` | `schema.method("greet", fn)` / `doc.call("greet")` |
-| `schema.index({ a: 1, b: -1 })` | `schema.index({{"a", 1}, {"b", -1}})` |
-| `Base.discriminator('Child', schema)` | `Base.discriminator("Child", schema)` |
-| `session.withTransaction(fn)` | `transaction(fn)` |
-| `doc.toJSON()` / `doc.toObject()` | `doc.toJSON()` / `doc.toObject()` |
+| `schema.virtual('posts', { ref, localField, foreignField })` | `schema.virtualPopulate("posts", {...})` |
+| `schema.methods.x = fn` / `schema.statics.x = fn` | `schema.method("x", fn)` / `schema.static_("x", fn)` |
+| `schema.plugin(fn, opts)` | `schema.plugin(fn, opts)` |
+| `Model.discriminator('Sensor', schema)` | `Model.discriminator("Sensor", schema)` |
+| `Model.bulkWrite([...])` | `Model.bulkWrite({...})` |
+| `Model.watch()` | `Model.watch()` |
+| `Query.cursor()` | `Query.cursor()` |
+| `mongoose.startSession()` + `withTransaction` | `transaction([&] {...})` |
+| `mongoose.set('debug', true)` | `setDebug(true)` |
 
 ---
 
-## 29. Mongoose se kya alag hai
+## Differences from Mongoose
 
-**Likhne ka tarika (C++ ki majboori):**
+C++ syntax:
 
-- `doc.name` nahi ho sakta → `doc["name"]` padhne ke liye, `doc.set("name", v)` likhne ke liye.
-- `doc["name"]` sirf padhne ka hai. Seedha badalna ho to `doc.mut("path")`.
-- `await` nahi: sab blocking hai. `nevla::async()` madad ke liye hai.
-- `virtual` C++ ka keyword hai, isliye `virtual_()`.
+- No property access (`doc.name`): use `doc["name"]` / `doc.get("name")` and `doc.set("name", v)`.
+- No `await`: every call is blocking; use `nevla::async` or your own thread pool.
+- `virtual_`, `static_`, `or_`, `and_` because of C++ keywords.
 
-**Jaan-boojh kar alag:**
+Behaviour:
 
-- Sub-documents ko apna `_id` nahi milta.
-- `__v` sirf `0` se shuru hota hai; array badalne par badhta nahi (optimistic locking nahi hai).
-- `insertMany` me ek bhi document galat ho to poora batch ruk jaata hai.
-- Ek hi connection (ek database) ek waqt me.
-
-**Abhi nahi hai (aage jod sakte ho):**
-
-- `post` query hooks (sirf `pre` hain); `aggregate` hooks
-- populate ke options (`select`, `match`, kai level `a.b` ke aage populate)
-- cursor / streaming (bahut bade result ke liye `skip` + `limit` se tukdon me padho)
-- types: `Decimal128`, `Buffer` (binary), `Map`, `BigInt`
-- update validators sirf `$set` par; `$push` waghera par nahi
-- plugins, change streams, kai connections, virtual populate
-- async (callback / coroutine) API
+- Sub-documents do not get their own `_id`.
+- Query `countDocuments()` ignores `skip`/`limit`.
+- One connection (one database) at a time; use the database's `$lookup`/`aggregate` for cross-db work.
+- Not implemented yet: `Decimal128`, `Buffer`/binary, `BigInt` types; `populate` across databases;
+  callback / coroutine async API; `Query.explain()`; `Model.translateAliases()`.
 
 ---
 
-## 30. Tests, examples, folder
+## Project layout, tests and examples
 
 ```
 nevla/
 ├── include/nevla/
-│   ├── nevla.hpp      <- bas yahi include karo
-│   ├── value.hpp      Value, Date, ObjectId
-│   ├── schema.hpp     Schema, Field, errors
-│   ├── model.hpp      connect, Model, Document, Query
-│   └── typed.hpp      NEVLA_STRUCT
-├── src/               value.cc, schema.cc, model.cc
+│   ├── nevla.hpp        # include this
+│   ├── value.hpp        # Value, Date, ObjectId
+│   ├── schema.hpp       # Schema, Field, errors
+│   ├── model.hpp        # connect, Model, Document, Query, Cursor, ChangeStream
+│   └── typed.hpp        # NEVLA_STRUCT
+├── src/                 # value.cc, schema.cc, model.cc
 ├── examples/
-│   ├── 01_quickstart.cc      CRUD
-│   ├── 02_blog.cc            populate, hooks, virtuals, methods
-│   ├── 03_iot.cc             custom _id, discriminators, TTL, aggregate, transaction
-│   └── 04_typed_struct.cc    NEVLA_STRUCT
-├── tests/test.cc      215 checks, asli MongoDB par
-├── CMakeLists.txt
-├── LICENSE            MIT
-└── README.md
+│   ├── 01_quickstart.cc     # CRUD
+│   ├── 02_blog.cc           # populate, hooks, virtuals, methods
+│   ├── 03_iot.cc            # custom _id, discriminators, TTL, aggregate, transaction
+│   ├── 04_typed_struct.cc   # NEVLA_STRUCT
+│   └── 05_features.cc       # statics, plugins, Map, getters, virtual populate, paginate, cursor, bulkWrite
+├── tests/test.cc        # 331 checks against a real MongoDB
+├── docs/README.hinglish.md
+├── .github/workflows/ci.yml
+├── CHANGELOG.md  CONTRIBUTING.md  LICENSE  CMakeLists.txt
 ```
 
 ```bash
-cd build
-./nevla_tests        # "215 passed, 0 failed"
-./01_quickstart
-./02_blog
-./03_iot
-./04_typed_struct
+./build/nevla_tests                                         # "331 passed, 0 failed"
+NEVLA_TEST_URI="mongodb://host:27017/?replicaSet=rs0" ./build/nevla_tests
+cd build && ctest
+./build/05_features
 ```
 
-Kis par test hua: Ubuntu 24.04, g++ 13, mongocxx 3.10.2, MongoDB 8 (replica set). AddressSanitizer + UBSan ke saath bhi saaf.
-
-CMake options: `-DNEVLA_BUILD_TESTS=OFF -DNEVLA_BUILD_EXAMPLES=OFF` (sirf library).
+Tested on Ubuntu 24.04, g++ 13, mongocxx 3.10.2, MongoDB 8 (single-node replica set), also under
+AddressSanitizer + UndefinedBehaviorSanitizer.
 
 ---
 
-## 31. Open-source karne ke steps
+## Contributing, changelog, license
 
-1. **Naam pakka karo.** "mongoose" naam mat rakhna (wo unka naam hai). GitHub par dekh lo ki jo naam chaho wo khaali hai.
-2. `LICENSE` me naam/saal dekh lo (MIT rakha hai: koi bhi, company bhi, free me use kar sake).
-3. GitHub par repo banao aur push karo:
-   ```bash
-   cd nevla
-   git init && git add . && git commit -m "nevla v0.1.0"
-   git branch -M main
-   git remote add origin https://github.com/<tum>/nevla.git
-   git push -u origin main
-   git tag v0.1.0 && git push --tags
-   ```
-4. README ke upar ek English hissa jod do (bahar ke log bhi padh saken).
-5. GitHub Actions me MongoDB service ke saath `nevla_tests` chalwa do, taaki har push par test ho.
-6. Baad me: vcpkg / Conan par daalna.
-
-### Naam badalna
-
-Poore project me `nevla` → naya naam, ek command se:
-
-```bash
-NEW=mynaam
-grep -rl --exclude-dir=build -i nevla . | xargs sed -i "s/nevla/$NEW/g; s/NEVLA/${NEW^^}/g"
-mv include/nevla include/$NEW && mv include/$NEW/nevla.hpp include/$NEW/$NEW.hpp
-```
-
----
-
-## License
-
-MIT. `LICENSE` file dekho.
+- Contributions are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md).
+- Release notes: [CHANGELOG.md](CHANGELOG.md).
+- Not affiliated with MongoDB, Inc. or the Mongoose project.
+- License: [MIT](LICENSE).

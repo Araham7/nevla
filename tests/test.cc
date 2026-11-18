@@ -1,10 +1,10 @@
-// nevla tests: asli MongoDB chahiye.
+// nevla tests: need a real MongoDB.
 //   NEVLA_TEST_URI="mongodb://127.0.0.1:27017" ./nevla_tests
-// Transactions wala test replica set par hi chalta hai (standalone par skip ho jata hai).
-#include <nevla/nevla.hpp>
-
+// Transactions and change streams need a replica set (they are skipped on a standalone server).
+#include <atomic>
 #include <cstdlib>
 #include <iostream>
+#include <nevla/nevla.hpp>
 #include <thread>
 
 using namespace nevla;
@@ -19,22 +19,22 @@ static int passed = 0, failed = 0;
             std::cout << "  FAIL " << __FILE__ << ":" << __LINE__ << "  " #cond << "\n"; \
         }                                                                                \
     } while (0)
-#define CHECK_THROWS(expr, Type)                                                                     \
-    do {                                                                                             \
-        bool nv_ok = false;                                                                          \
-        try {                                                                                        \
-            expr;                                                                                    \
-        } catch (const Type &) {                                                                     \
-            nv_ok = true;                                                                            \
-        } catch (const std::exception &e) {                                                          \
-            std::cout << "  (galat exception: " << e.what() << ")\n";                                \
-        }                                                                                            \
-        if (nv_ok)                                                                                   \
-            ++passed;                                                                                \
-        else {                                                                                       \
-            ++failed;                                                                                \
-            std::cout << "  FAIL " << __FILE__ << ":" << __LINE__ << "  " #expr " ne " #Type " nahi feka\n"; \
-        }                                                                                            \
+#define CHECK_THROWS(expr, Type)                                                                              \
+    do {                                                                                                      \
+        bool nv_ok = false;                                                                                   \
+        try {                                                                                                 \
+            expr;                                                                                             \
+        } catch (const Type &) {                                                                              \
+            nv_ok = true;                                                                                     \
+        } catch (const std::exception &e) {                                                                   \
+            std::cout << "  (wrong exception: " << e.what() << ")\n";                                         \
+        }                                                                                                     \
+        if (nv_ok)                                                                                            \
+            ++passed;                                                                                         \
+        else {                                                                                                \
+            ++failed;                                                                                         \
+            std::cout << "  FAIL " << __FILE__ << ":" << __LINE__ << "  " #expr " did not throw " #Type "\n"; \
+        }                                                                                                     \
     } while (0)
 static void section(const char *name) { std::cout << "- " << name << "\n"; }
 
@@ -53,10 +53,14 @@ struct UserRow {
 };
 NEVLA_STRUCT(UserRow, id, name, email, age, tags, nick, address)
 
-/* ============================ bina DB wale ============================ */
+/* ============================ no database needed ============================ */
 static void testValue() {
     section("Value");
-    Value v = {{"name", "Araham"}, {"age", 24}, {"ok", true}, {"pi", 3.5}, {"tags", Value::array({"a", "b"})},
+    Value v = {{"name", "Araham"},
+               {"age", 24},
+               {"ok", true},
+               {"pi", 3.5},
+               {"tags", Value::array({"a", "b"})},
                {"address", {{"city", "Durgapur"}, {"pin", 713402}}}};
     CHECK(v.isObject());
     CHECK(v["name"].asString() == "Araham");
@@ -113,7 +117,7 @@ static void testValue() {
 }
 
 static void testSchemaOffline() {
-    section("Schema: cast + defaults + validation (bina DB)");
+    section("Schema: cast + defaults + validation (no DB)");
     Schema s({
         {"name", String().required().trim().minLength(2).maxLength(10)},
         {"email", String().lowercase().match("^[^@]+@[^@]+$", "email galat hai")},
@@ -132,11 +136,18 @@ static void testSchemaOffline() {
     });
     auto M = model("OfflineThing", s);
 
-    auto d = M({{"name", "  Araham  "}, {"email", "A@B.COM"}, {"code", "ab"}, {"age", "24"}, {"active", "false"},
-                {"joined", "2026-01-02T03:04:05.000Z"}, {"slug", "x"}, {"tags", Value::array({"IoT", "ESP"})},
+    auto d = M({{"name", "  Araham  "},
+                {"email", "A@B.COM"},
+                {"code", "ab"},
+                {"age", "24"},
+                {"active", "false"},
+                {"joined", "2026-01-02T03:04:05.000Z"},
+                {"slug", "x"},
+                {"tags", Value::array({"IoT", "ESP"})},
                 {"address", {{"city", "Durgapur"}, {"pin", "713402"}}},
                 {"items", Value::array({{{"sku", "A1"}}, {{"sku", "B2"}, {"qty", 3}}})},
-                {"any", {{"kuch", "bhi"}}}, {"faltu", 1}});
+                {"any", {{"kuch", "bhi"}}},
+                {"faltu", 1}});
     CHECK(d["name"].asString() == "Araham");
     CHECK(d["email"].asString() == "a@b.com");
     CHECK(d["code"].asString() == "AB");
@@ -154,14 +165,30 @@ static void testSchemaOffline() {
     CHECK(!d.has("faltu"));  // strict
     CHECK(d["_id"].isObjectId() && d.id().size() == 24);
     CHECK(d.isNew());
-    d.validate();  // sab theek
+    d.validate();  // all valid
 
-    CHECK_THROWS(M({{"age", "abc"}}), CastError);
-    CHECK_THROWS(M({{"joined", "kal"}}), CastError);
-    CHECK_THROWS(M({{"address", 5}}), CastError);
+    // Like Mongoose: a value that cannot be cast is reported by validate() as a ValidationError (kind "cast")
+    {
+        auto c = M({{"name", "Araham"}, {"email", "a@b.com"}, {"age", "abc"}, {"joined", "kal"}, {"address", 5}});
+        try {
+            c.validate();
+            CHECK(false);
+        } catch (const ValidationError &e) {
+            CHECK(e.errors.count("age") && e.kinds.at("age") == "cast");
+            CHECK(e.errors.count("joined") && e.kinds.at("joined") == "cast");
+            CHECK(e.errors.count("address"));
+        }
+        c.set("age", "abc");
+        CHECK_THROWS(c.validate(), ValidationError);
+    }
 
-    auto bad = M({{"name", "A"}, {"email", "galat"}, {"age", 200}, {"role", "raja"}, {"even", 3},
-                  {"address", {{"pin", 1}}}, {"items", Value::array({{{"qty", 0}}})}});
+    auto bad = M({{"name", "A"},
+                  {"email", "galat"},
+                  {"age", 200},
+                  {"role", "raja"},
+                  {"even", 3},
+                  {"address", {{"pin", 1}}},
+                  {"items", Value::array({{{"qty", 0}}})}});
     try {
         bad.validate();
         CHECK(false);
@@ -181,7 +208,8 @@ static void testSchemaOffline() {
         missing.validate();
         CHECK(false);
     } catch (const ValidationError &e) {
-        CHECK(e.errors.size() == 2 && e.errors.count("name") && e.errors.count("address.city"));  // nested ke required bhi
+        CHECK(e.errors.size() == 2 && e.errors.count("name") &&
+              e.errors.count("address.city"));  // required inside nested objects too
         CHECK(e.errors.at("name") == "Path `name` is required.");
     }
 
@@ -209,7 +237,7 @@ static void testSchemaOffline() {
     u.tags = {"a", "b"};
     u.address = {"Kolkata", 700001};
     Value uv = toValue(u);
-    CHECK(!uv.contains("_id"));  // khaali id nahi jata
+    CHECK(!uv.contains("_id"));  // an empty id is not sent
     CHECK(uv["address"]["city"].asString() == "Kolkata");
     CHECK(uv["nick"].isNull());
     uv["_id"] = ObjectId::generate();
@@ -235,8 +263,12 @@ static void testCrud() {
     CHECK(User.collectionName() == "users");
     User.dropCollection();
 
-    auto a = User.create({{"name", " Araham "}, {"email", "ARAHAM@X.IN"}, {"age", 24}, {"password", "chhupa"},
-                          {"tags", Value::array({"iot", "cpp"})}, {"address", {{"city", "Durgapur"}, {"pin", 713402}}},
+    auto a = User.create({{"name", " Araham "},
+                          {"email", "ARAHAM@X.IN"},
+                          {"age", 24},
+                          {"password", "chhupa"},
+                          {"tags", Value::array({"iot", "cpp"})},
+                          {"address", {{"city", "Durgapur"}, {"pin", 713402}}},
                           {"device", "d1"}});
     CHECK(!a.isNew() && !a.isModified());
     CHECK(a["createdAt"].isDate() && a["updatedAt"].isDate());
@@ -256,7 +288,7 @@ static void testCrud() {
     CHECK_THROWS(User.insertMany({{{"name", "ok"}, {"email", "ok@x.in"}}, {{"name", "bad"}}}), ValidationError);
     CHECK(User.countDocuments() == 4);
 
-    // findById: string id bhi chalti hai, select(false) field nahi aata
+    // findById: a string id works too, select(false) fields are hidden
     auto got = User.findById(a.id()).exec();
     CHECK(got && (*got)["name"].asString() == "Araham");
     CHECK(got && !got->has("password"));
@@ -340,9 +372,10 @@ static void testCrud() {
     // distinct + aggregate
     CHECK(User.distinct("role").size() == 2);
     CHECK(User.distinct("role", {{"age", {{"$lt", 20}}}}).size() == 1);
-    auto agg = User.aggregate(Value::array({{{"$group", {{"_id", "$role"}, {"n", {{"$sum", 1}}}}}},
-                                            {{"$sort", {{"_id", 1}}}}}));
-    CHECK(agg.size() == 2 && agg[0]["_id"].asString() == "admin" && agg[0]["n"].asInt() == 2 && agg[1]["n"].asInt() == 3);
+    auto agg = User.aggregate(
+        Value::array({{{"$group", {{"_id", "$role"}, {"n", {{"$sum", 1}}}}}}, {{"$sort", {{"_id", 1}}}}}));
+    CHECK(agg.size() == 2 && agg[0]["_id"].asString() == "admin" && agg[0]["n"].asInt() == 2 &&
+          agg[1]["n"].asInt() == 3);
 
     // delete
     CHECK(User.deleteOne({{"email", "naya@x.in"}}) == 1);
@@ -353,7 +386,7 @@ static void testCrud() {
     CHECK(User.countDocuments() == 1);
     CHECK(User.deleteMany() == 1);
 
-    // save() jab document DB se gayab ho
+    // save() when the document was removed from the DB
     auto ghost = User.create({{"name", "Ghost"}, {"email", "ghost@x.in"}});
     User.deleteMany();
     ghost.set("age", 1);
@@ -378,7 +411,10 @@ static void testCrud() {
 static void testHooksVirtualsMethods() {
     section("hooks + virtuals + methods + toJSON");
     std::vector<std::string> log;
-    Schema s({{"first", String().required()}, {"last", String()}, {"password", String()}, {"deleted", Boolean().def(false)},
+    Schema s({{"first", String().required()},
+              {"last", String()},
+              {"password", String()},
+              {"deleted", Boolean().def(false)},
               {"logins", Int().def(0)}},
              {.virtuals = true});
     s.pre("validate", [&](Document &) { log.push_back("pre-validate"); });
@@ -422,7 +458,7 @@ static void testHooksVirtualsMethods() {
 
     log.clear();
     p.set("last", "A.").save();
-    CHECK(P.findById(p._id()).orFail()["password"].asString() == "hash:1234");  // dobara hash nahi
+    CHECK(P.findById(p._id()).orFail()["password"].asString() == "hash:1234");  // not hashed again
     CHECK(log.size() == 4 && log[2] == "pre-save");
 
     P.create({{"first", "Hata"}, {"deleted", true}});
@@ -457,9 +493,11 @@ static void testPopulate() {
     auto a2 = Author.create({{"name", "Tagore"}});
     auto t1 = Tag.create({{"label", "hindi"}}), t2 = Tag.create({{"label", "classic"}});
     ObjectId missing = ObjectId::generate();
-    auto p1 = Post.create({{"title", "Godaan"}, {"author", a1.id()},  // string id -> ObjectId cast
+    auto p1 = Post.create({{"title", "Godaan"},
+                           {"author", a1.id()},  // string id -> ObjectId cast
                            {"tags", Value::array({t1._id(), t2._id(), missing})},
-                           {"comments", Value::array({{{"by", a2._id()}, {"text", "waah"}}, {{"by", a1._id()}, {"text", "dhanyavaad"}}})}});
+                           {"comments", Value::array({{{"by", a2._id()}, {"text", "waah"}},
+                                                      {{"by", a1._id()}, {"text", "dhanyavaad"}}})}});
     Post.create({{"title", "Gitanjali"}, {"author", a2._id()}});
     Post.create({{"title", "Anaam"}});
     Post.create({{"title", "Bhoot"}, {"author", missing}});
@@ -479,14 +517,14 @@ static void testPopulate() {
     CHECK(one["author"].isObjectId());
     one.populate("author");
     CHECK(one["author"]["name"].asString() == "Premchand");
-    one.populate("author");  // dobara: kuch nahi bigadta
+    one.populate("author");  // populating twice is harmless
     CHECK(one["author"]["name"].asString() == "Premchand");
 
     auto lean = Post.findOne({{"title", "Gitanjali"}}).populate("author").lean();
     CHECK(lean && (*lean)["author"]["name"].asString() == "Tagore");
     CHECK_THROWS(Post.find().populate("plain").exec(), Error);
 
-    // ref se filter: string id cast hoti hai
+    // filter by ref: a string id is cast
     CHECK(Post.find({{"author", a2.id()}}).count() == 1);
     CHECK(Post.find({{"tags", t1.id()}}).count() == 1);
     Author.dropCollection();
@@ -507,14 +545,14 @@ static void testDiscriminators() {
     Relay.create({{"name", "pump"}, {"channels", 4}});
     CHECK(s["__t"].asString() == "Sensor");
     CHECK_THROWS(Sensor.create({{"name", "no-unit"}}), ValidationError);
-    CHECK(!Device({{"name", "x"}, {"unit", "C"}}).has("unit"));  // base schema me unit nahi
+    CHECK(!Device({{"name", "x"}, {"unit", "C"}}).has("unit"));  // `unit` is not in the base schema
 
     CHECK(Device.countDocuments() == 3);
     CHECK(Sensor.countDocuments() == 1 && Relay.countDocuments() == 1);
     CHECK(Sensor.find().exec()[0]["unit"].asString() == "C");
     auto all = Device.find().sort("name").exec();
     CHECK(all[0].modelName() == "Device" && all[1].modelName() == "Relay" && all[2].modelName() == "Sensor");
-    all[2].set("value", "40.25").save();  // base se mila, par Sensor schema se cast
+    all[2].set("value", "40.25").save();  // loaded via the base model, cast with the Sensor schema
     CHECK(Sensor.findOne().orFail()["value"].asDouble() == 40.25);
     CHECK(Sensor.aggregate(Value::array({{{"$count", "n"}}}))[0]["n"].asInt() == 1);
     Sensor.updateMany({}, {{"online", true}});
@@ -591,7 +629,7 @@ static void testTransactions() {
     CHECK_THROWS(transaction([&] {
                      Acc.updateOne({{"owner", "a"}}, {{"$inc", {{"balance", -10}}}});
                      Acc.create({{"owner", "c"}, {"balance", 5}});
-                     CHECK(Acc.countDocuments() == 3);  // transaction ke andar dikhta hai
+                     CHECK(Acc.countDocuments() == 3);  // visible inside the transaction
                      throw Error("beech me gadbad");
                  }),
                  Error);
@@ -617,17 +655,418 @@ static void testThreads() {
     C.dropCollection();
 }
 
+/* ============================ v0.2 features ============================ */
+static void testSchemaFeaturesOffline() {
+    section("Schema v0.2: messages, kinds, Date min/max, Map, alias, getters (no DB)");
+    Schema s(
+        {
+            {"name", String().required(true, "{PATH} is mandatory").alias("n")},
+            {"age", Int().min(18, "{PATH} must be 18+, got {VALUE}").max(99)},
+            {"role", String().enumOf({"user", "admin"}, "{VALUE} is not a role")},
+            {"born", DateTime().min(*Date::parse("1900-01-01")).max(*Date::parse("2030-01-01"))},
+            {"prices", Map(Number().min(0))},
+            {"price", Number().get([](const Value &v) { return Value(v.asDouble() / 100.0); })},
+            {"code", String().match("^[A-Z]{3}$")},
+        },
+        {.getters = true});
+    auto M = model("FeatureThing", s);
+    auto d =
+        M({{"n", "Asha"}, {"age", 20}, {"prices", {{"inr", "100"}, {"usd", 2}}}, {"price", 1250}, {"code", "ABC"}});
+    CHECK(d["name"].asString() == "Asha");   // alias -> real field
+    CHECK(d.get("n").asString() == "Asha");  // read via alias
+    CHECK(d["prices.inr"].isNumber() && d["prices.inr"].asDouble() == 100);
+    CHECK(d.get("price").asDouble() == 12.5);  // getter
+    CHECK(d["price"].asInt() == 1250);         // raw value untouched
+    CHECK(d.toJSON()["price"].asDouble() == 12.5);
+    d.validate();
+    d.set("n", "Ravi");
+    CHECK(d["name"].asString() == "Ravi" && d.isModified("name"));
+
+    auto bad = M({{"age", 10}, {"role", "king"}, {"born", "1800-05-05"}, {"prices", {{"inr", -1}}}, {"code", "abcd"}});
+    try {
+        bad.validate();
+        CHECK(false);
+    } catch (const ValidationError &e) {
+        CHECK(e.errors.at("name") == "name is mandatory");
+        CHECK(e.kinds.at("name") == "required");
+        CHECK(e.errors.at("age") == "age must be 18+, got 10");
+        CHECK(e.kinds.at("age") == "min");
+        CHECK(e.errors.at("role") == "king is not a role");
+        CHECK(e.kinds.at("role") == "enum");
+        CHECK(e.kinds.at("born") == "min");
+        CHECK(e.errors.count("prices.inr"));
+        CHECK(e.kinds.at("code") == "regexp");
+    }
+    CHECK_THROWS(M({{"prices", {{"$bad", 1}}}}).validate(), ValidationError);  // Map keys cannot start with '$'
+    CHECK_THROWS(String().match("(unclosed"), Error);                          // invalid regex fails early
+    CHECK(!Date::parse("2026-02-30"));                                         // invalid calendar date
+    CHECK(Date::parse("2024-02-29").has_value());                              // leap year ok
+
+    // plugin + static + remove
+    Schema p({{"title", String()}, {"tmp", String()}});
+    p.plugin([](Schema &sc, const Value &opt) { sc.add(opt["field"].asString(), Boolean().def(false)); },
+             Value{{"field", "deleted"}});
+    p.remove("tmp");
+    CHECK(p.field("deleted") && !p.field("tmp"));
+}
+
+static void testUpdateCasting() {
+    section("update casting: strict, immutable, $inc, $pull, runValidators, custom timestamps");
+    Schema s({{"name", String().required()},
+              {"code", String().immutable()},
+              {"n", Int().def(0)},
+              {"tags", Array(String().lowercase())},
+              {"items", Array(Schema({{"sku", String()}, {"qty", Int()}}))},
+              {"label", String().alias("l")}},
+             {.timestamps = true, .createdAt = "created_at", .updatedAt = "updated_at"});
+    auto T = model("UpdThing", s);
+    T.dropCollection();
+    auto d = T.create({{"name", "a"},
+                       {"code", "X1"},
+                       {"tags", Value::array({"A"})},
+                       {"items", Value::array({{{"sku", "s1"}, {"qty", 1}}})}});
+    CHECK(d.has("created_at") && d.has("updated_at") && !d.has("createdAt"));
+
+    T.updateOne({{"_id", d._id()}}, {{"junk", 1}, {"code", "Y"}, {"$inc", {{"n", "5"}}}, {"l", "hi"}});
+    auto r = T.findById(d._id()).lean().value();
+    CHECK(!r.contains("junk"));           // strict: unknown path dropped
+    CHECK(r["code"].asString() == "X1");  // immutable: not changed
+    CHECK(r["n"].isInt() && r["n"].asInt() == 5);
+    CHECK(r["label"].asString() == "hi");  // alias in update
+    CHECK(r["updated_at"].isDate());
+
+    T.updateOne({{"_id", d._id()}}, {{"$set", {{"items.$[].qty", "7"}}}});
+    CHECK(T.findById(d._id()).lean().value()["items"].at(0)["qty"].asInt() == 7);  // positional path cast
+
+    T.updateOne({{"_id", d._id()}}, {{"$pull", {{"tags", "A"}}}});  // "A" -> "a" (lowercase) -> pulled
+    CHECK(T.findById(d._id()).lean().value()["tags"].empty());
+
+    CHECK_THROWS(T.updateOne({{"_id", d._id()}}, {{"$inc", {{"name", 1}}}}), CastError);
+    CHECK_THROWS(T.updateOne({{"_id", d._id()}}, {{"$inc", {{"n", "abc"}}}}), CastError);
+    CHECK_THROWS(T.updateOne({{"_id", d._id()}}, {{"$unset", {{"name", ""}}}}, {.runValidators = true}),
+                 ValidationError);
+    auto up = T.updateOne({{"name", "new"}}, {{"code", "Z9"}}, {.upsert = true});
+    CHECK(!up.upsertedId.isNull());
+    auto created = T.findById(up.upsertedId).lean().value();
+    CHECK(created["code"].asString() == "Z9");  // immutable on upsert -> $setOnInsert
+    CHECK(created["n"].asInt() == 0);           // default on insert
+    CHECK(created["created_at"].isDate());
+
+    CHECK(model("Category", Schema()).collectionName() == "categories");
+    CHECK(model("Person", Schema()).collectionName() == "people");
+    CHECK(model("Box", Schema()).collectionName() == "boxes");
+    CHECK(model("Status", Schema()).collectionName() == "status");
+    T.dropCollection();
+}
+
+static void testQueryFeatures() {
+    section("query: or/and/nor, elemMatch, size, all, collation, cursor, paginate, distinct");
+    auto Q = model("QItem", Schema({{"name", String()},
+                                    {"n", Int()},
+                                    {"tags", Array(String())},
+                                    {"parts", Array(Schema({{"k", String()}, {"v", Int()}}))}}));
+    Q.dropCollection();
+    std::vector<Value> rows;
+    for (int i = 1; i <= 25; i++)
+        rows.push_back({{"name", i % 2 ? "Odd" : "even"},
+                        {"n", i},
+                        {"tags", i % 3 ? Value::array({"a"}) : Value::array({"a", "b"})},
+                        {"parts", Value::array({{{"k", "x"}, {"v", i}}})}});
+    Q.insertMany(rows);
+
+    CHECK(Q.find().or_({{{"n", 1}}, {{"n", "2"}}}).count() == 2);
+    CHECK(Q.find().and_({{{"n", {{"$gte", 5}}}}, {{"n", {{"$lte", 6}}}}}).count() == 2);
+    CHECK(Q.find().nor({{{"name", "Odd"}}}).count() == 12);
+    CHECK(Q.where("parts").elemMatch({{"k", "x"}, {"v", {{"$gt", "20"}}}}).count() == 5);
+    CHECK(Q.where("tags").size(2).count() == 8);
+    CHECK(Q.where("tags").all({"a", "b"}).count() == 8);
+    CHECK(Q.find().where({{"name", "Odd"}}).where("n").lt(5).count() == 2);
+    CHECK(Q.find({{"name", "odd"}}).collation({{"locale", "en"}, {"strength", 2}}).count() == 13);
+    CHECK(Q.find().sort("-n").limit(1).maxTimeMS(5000).comment("t").hint("_id_").exec()[0]["n"].asInt() == 25);
+
+    int seen = 0;
+    auto cur = Q.find({{"n", {{"$lte", 10}}}}).sort("n").batchSize(3).cursor();
+    while (auto doc = cur.next()) {
+        ++seen;
+        CHECK(doc->isNew() == false);
+    }
+    CHECK(seen == 10);
+    CHECK(!cur.next());
+    int sum = 0;
+    Q.find().forEach([&](Document &doc) { sum += static_cast<int>(doc["n"].asInt()); });
+    CHECK(sum == 325);
+
+    auto pg = Q.find().sort("n").paginate(3, 10);
+    CHECK(pg.total == 25 && pg.pages == 3 && pg.docs.size() == 5 && !pg.hasNext && pg.hasPrev);
+    CHECK(pg.docs[0]["n"].asInt() == 21);
+    CHECK(Q.find({{"n", {{"$lte", 4}}}}).distinct("name").size() == 2);
+    CHECK(Q.exists({{"n", 3}}) && !Q.exists({{"n", 300}}));
+    CHECK_THROWS(Q.find({{"n", "abc"}}).count(), CastError);
+    Q.dropCollection();
+}
+
+static void testPopulateFeatures() {
+    section("populate options, nested populate, virtual populate, depopulate");
+    auto Company = model("PCompany", Schema({{"name", String()}}));
+    Schema writer({{"name", String()}, {"company", Id().ref("PCompany")}});
+    writer.virtualPopulate("articles", {.ref = "PArticle", .localField = "_id", .foreignField = "writer"});
+    writer.virtualPopulate("latest",
+                           {.ref = "PArticle", .localField = "_id", .foreignField = "writer", .justOne = true});
+    auto Writer = model("PWriter", writer);
+    auto Article = model("PArticle", Schema({{"title", String()},
+                                             {"n", Int()},
+                                             {"writer", Id().ref("PWriter")},
+                                             {"refs", Array(Id().ref("PWriter"))}}));
+    Company.dropCollection();
+    Writer.dropCollection();
+    Article.dropCollection();
+    auto c = Company.create({{"name", "Acme"}});
+    auto w1 = Writer.create({{"name", "Ana"}, {"company", c._id()}});
+    auto w2 = Writer.create({{"name", "Bo"}, {"company", c._id()}});
+    for (int i = 1; i <= 3; i++)
+        Article.create({{"title", "A" + std::to_string(i)},
+                        {"n", i},
+                        {"writer", w1._id()},
+                        {"refs", Value::array({w2._id(), w1._id()})}});
+
+    PopulateOptions po;
+    po.path = "writer";
+    po.select = "name company";
+    PopulateOptions nested;
+    nested.path = "company";
+    po.populate.push_back(nested);
+    auto arts = Article.find().sort("n").populate(po).exec();
+    CHECK(arts.size() == 3);
+    CHECK(arts[0]["writer.name"].asString() == "Ana");
+    CHECK(arts[0]["writer.company.name"].asString() == "Acme");  // nested populate
+    CHECK(arts[0].populated("writer"));
+
+    PopulateOptions refs;
+    refs.path = "refs";
+    refs.sort = "name";
+    refs.limit = 1;
+    auto a = Article.findOne({{"n", 1}}).populate(refs).orFail();
+    CHECK(a["refs"].size() == 1 && a["refs"].at(0)["name"].asString() == "Ana");
+
+    PopulateOptions m;
+    m.path = "writer";
+    m.match = {{"name", "Nobody"}};
+    CHECK(Article.findOne({{"n", 1}}).populate(m).orFail()["writer"].isNull());
+
+    // virtual populate
+    PopulateOptions va;
+    va.path = "articles";
+    va.sort = "-n";
+    va.limit = 2;
+    auto w = Writer.findById(w1._id()).populate(va).populate("latest").orFail();
+    CHECK(w["articles"].size() == 2 && w["articles"].at(0)["n"].asInt() == 3);
+    CHECK(w["latest"].isObject());
+    CHECK(Writer.findById(w2._id()).populate("articles").orFail()["articles"].empty());
+
+    // saving a populated document stores ids, not whole documents
+    auto doc = Article.findOne({{"n", 2}}).populate("writer").orFail();
+    doc.set("title", "changed");
+    doc.mut("writer");  // even if the populated path is marked modified
+    doc.save();
+    auto raw = Article.findOne({{"n", 2}}).lean().value();
+    CHECK(raw["writer"].isObjectId());
+    doc.depopulate("writer");
+    CHECK(doc["writer"].isObjectId() && !doc.populated("writer"));
+
+    Company.dropCollection();
+    Writer.dropCollection();
+    Article.dropCollection();
+}
+
+static void testStaticsHooksDocs() {
+    section("statics, post query hooks, aggregate hooks, document helpers, versioning");
+    Schema s({{"email", String().lowercase()}, {"tags", Array(String())}, {"n", Int().def(0)}});
+    s.static_("byEmail", [](const Model &M, const Value &email) {
+        auto d = M.findOne({{"email", email}}).lean();
+        return d ? *d : Value();
+    });
+    int postFind = 0, postUpdate = 0;
+    s.post("find", [&](QueryInfo &, Value &result) {
+        postFind++;
+        for (auto &r : result.elements()) r["seen"] = true;
+    });
+    s.post("updateOne", [&](QueryInfo &q, Value &result) {
+        postUpdate += static_cast<int>(result["matchedCount"].asInt());
+        CHECK(q.update != nullptr);
+    });
+    s.pre("aggregate", [](QueryInfo &q) { q.filter.push_back(Value{{"$limit", 1}}); });
+    auto S = model("SThing", s, "sthings");
+    S.dropCollection();
+    auto a = S.create({{"email", "A@X.COM"}});
+    auto b = S.create({{"email", "b@x.com"}});
+    CHECK(S.call("byEmail", "a@x.com")["_id"] == a._id());
+    CHECK_THROWS(S.call("nope"), Error);
+    auto rows = S.find().lean();
+    CHECK(postFind == 1 && rows[0]["seen"].asBool());
+    S.updateOne({{"_id", a._id()}}, {{"n", 1}});
+    CHECK(postUpdate == 1);
+    CHECK(S.aggregate(Value::array({Value{{"$match", Value::object()}}})).size() == 1);
+
+    // document helpers
+    auto a2 = S.findById(a._id()).orFail();
+    CHECK(a2.equals(a) && !a2.equals(b));
+    a2.updateOne({{"$inc", {{"n", 10}}}});
+    CHECK(S.findById(a._id()).lean().value()["n"].asInt() == 11);
+
+    // __v goes up when an array changes or increment() is called
+    auto v = S.findById(b._id()).orFail();
+    CHECK(v["__v"].asInt() == 0);
+    v.push("tags", "x");
+    v.save();
+    CHECK(v["__v"].asInt() == 1 && S.findById(b._id()).lean().value()["__v"].asInt() == 1);
+    v.increment().save();
+    CHECK(S.findById(b._id()).lean().value()["__v"].asInt() == 2);
+
+    v.overwrite({{"email", "c@x.com"}});
+    v.save();
+    auto ov = S.findById(b._id()).lean().value();
+    CHECK(ov["email"].asString() == "c@x.com" && !ov.contains("tags") && ov["_id"] == b._id());
+
+    // optimistic concurrency
+    Schema oc({{"qty", Int()}}, {.optimisticConcurrency = true});
+    auto O = model("OcThing", oc);
+    O.dropCollection();
+    auto o = O.create({{"qty", 1}});
+    auto copy1 = O.findById(o._id()).orFail();
+    auto copy2 = O.findById(o._id()).orFail();
+    copy1.set("qty", 2).save();
+    CHECK(copy1["__v"].asInt() == 1);
+    copy2.set("qty", 3);
+    CHECK_THROWS(copy2.save(), VersionError);
+    CHECK(O.findById(o._id()).lean().value()["qty"].asInt() == 2);
+    O.findById(o._id()).orFail().deleteOne();
+    copy1.set("qty", 9);
+    CHECK_THROWS(copy1.save(), NotFoundError);
+    O.dropCollection();
+    S.dropCollection();
+}
+
+static void testModelExtras() {
+    section("replaceOne, findOneAndReplace, bulkWrite, watch, indexes, debug, reconnect");
+    Schema s({{"sku", String().unique()}, {"qty", Int().min(0)}, {"note", String()}}, {.timestamps = true});
+    auto B = model("BItem", s);
+    B.dropCollection();
+    B.create({{"sku", "a"}, {"qty", 1}, {"note", "x"}});
+
+    auto rr = B.replaceOne({{"sku", "a"}}, {{"sku", "a"}, {"qty", "5"}, {"junk", 1}});
+    CHECK(rr.matchedCount == 1);
+    auto rep = B.findOne({{"sku", "a"}}).lean().value();
+    CHECK(rep["qty"].asInt() == 5 && !rep.contains("note") && !rep.contains("junk") && rep["updatedAt"].isDate());
+    CHECK_THROWS(B.replaceOne({{"sku", "a"}}, {{"$set", {{"qty", 1}}}}), Error);
+    auto fr = B.findOneAndReplace({{"sku", "a"}}, {{"sku", "a"}, {"qty", 6}}, {.returnNew = true});
+    CHECK(fr && (*fr)["qty"].asInt() == 6);
+
+    auto bw = B.bulkWrite({
+        {{"insertOne", {{"document", {{"sku", "b"}, {"qty", 2}}}}}},
+        {{"insertOne", {{"document", {{"sku", "c"}, {"qty", 3}}}}}},
+        {{"updateOne", {{"filter", {{"sku", "b"}}}, {"update", {{"$inc", {{"qty", 1}}}}}}}},
+        {{"updateMany", {{"filter", Value::object()}, {"update", {{"note", "bulk"}}}}}},
+        {{"updateOne", {{"filter", {{"sku", "z"}}}, {"update", {{"qty", 9}}}, {"upsert", true}}}},
+        {{"deleteOne", {{"filter", {{"sku", "c"}}}}}},
+    });
+    CHECK(bw.insertedCount == 2 && bw.deletedCount == 1 && bw.upsertedCount == 1);
+    CHECK(B.findOne({{"sku", "b"}}).lean().value()["qty"].asInt() == 3);
+    CHECK(B.countDocuments({{"note", "bulk"}}) == 2);
+    CHECK_THROWS(B.bulkWrite({{{"explode", Value::object()}}}), Error);
+    CHECK_THROWS(B.bulkWrite({{{"insertOne", {{"document", {{"qty", -1}}}}}}}), ValidationError);
+
+    // insertMany ordered=false keeps going after a duplicate
+    try {
+        B.insertMany({{{"sku", "a"}}, {{"sku", "u1"}}, {{"sku", "u2"}}}, {.ordered = false});
+        CHECK(false);
+    } catch (const DuplicateKeyError &) {
+        CHECK(B.countDocuments({{"sku", {{"$in", Value::array({"u1", "u2"})}}}}) == 2);
+    }
+
+    // debug callback
+    std::vector<std::string> ops;
+    setDebug([&](const std::string &coll, const std::string &op, const Value &) { ops.push_back(coll + "." + op); });
+    B.countDocuments();
+    setDebug(false);
+    CHECK(!ops.empty() && ops.back() == "bitems.countDocuments");
+
+    // a failing automatic index does not break the model
+    auto Dup = model("DupThing", Schema({{"k", String()}}), "dup_things");
+    Dup.dropCollection();
+    Dup.create({{"k", "same"}});
+    Dup.create({{"k", "same"}});
+    std::string indexErr;
+    onIndexError([&](const std::string &model, const std::string &msg) { indexErr = model + ": " + msg; });
+    auto Dup2 = model("DupThing2", Schema({{"k", String().unique()}}), "dup_things");
+    CHECK(Dup2.countDocuments() == 2);  // works even though the unique index failed
+    CHECK(indexErr.find("DupThing2") == 0);
+    CHECK_THROWS(Dup2.createIndexes(), DuplicateKeyError);
+    onIndexError(nullptr);
+
+    // syncIndexes drops indexes that are no longer in the schema
+    Schema withIdx({{"a", Int().index()}, {"b", Int().index()}, {"exp", DateTime().expires(3600)}});
+    auto I1 = model("IdxThing", withIdx, "idx_things");
+    I1.dropCollection();
+    I1.createIndexes();
+    bool ttl = false;
+    for (auto &ix : I1.listIndexes()) ttl |= ix["expireAfterSeconds"].asInt() == 3600;
+    CHECK(ttl);
+    CHECK(I1.listIndexes().size() == 4);
+    auto I2 = model("IdxThing2", Schema({{"a", Int().index()}}), "idx_things");
+    I2.syncIndexes();
+    CHECK(I2.listIndexes().size() == 2);  // _id_ + a_1
+    I1.dropCollection();
+    Dup.dropCollection();
+
+    // change stream (replica set only)
+    try {
+        auto stream = B.watch(Value::array(), {.fullDocument = true, .maxAwaitMS = 500});
+        B.create({{"sku", "w1"}, {"qty", 1}});
+        std::optional<Value> ev;
+        for (int i = 0; i < 10 && !ev; i++) ev = stream.next();
+        CHECK(ev && (*ev)["operationType"].asString() == "insert" && (*ev)["fullDocument"]["sku"].asString() == "w1");
+    } catch (const Error &e) {
+        std::cout << "  (watch skipped: " << e.what() << ")\n";
+    }
+
+    // reconnect while other threads keep working
+    std::atomic<bool> stop{false};
+    std::atomic<int> errors{0}, okOps{0};
+    std::vector<std::thread> ts;
+    for (int t = 0; t < 4; t++)
+        ts.emplace_back([&] {
+            while (!stop) {
+                try {
+                    B.countDocuments();
+                    okOps++;
+                } catch (const Error &) {
+                    errors++;
+                }
+            }
+        });
+    const char *env = std::getenv("NEVLA_TEST_URI");
+    std::string uri = env ? env : "mongodb://127.0.0.1:27017/?directConnection=true";
+    for (int i = 0; i < 5; i++) connect(uri, "nevla_test");
+    stop = true;
+    for (auto &t : ts) t.join();
+    CHECK(errors == 0 && okOps > 0);
+    CHECK(databaseName() == "nevla_test");
+    ping();
+    B.dropCollection();
+}
+
 int main() {
     testValue();
     testSchemaOffline();
+    testSchemaFeaturesOffline();
 
     const char *env = std::getenv("NEVLA_TEST_URI");
     std::string uri = env ? env : "mongodb://127.0.0.1:27017/?directConnection=true";
-    CHECK_THROWS(model("OfflineThing").countDocuments(), Error);  // connect se pehle
+    CHECK_THROWS(model("OfflineThing").countDocuments(), Error);  // before connect()
     try {
         connect(uri, "nevla_test");
     } catch (const Error &e) {
-        std::cout << "MongoDB se connect nahi hua (" << e.what() << ")\n";
+        std::cout << "Could not connect to MongoDB (" << e.what() << ")\n";
         return 2;
     }
     CHECK(connected());
@@ -638,6 +1077,11 @@ int main() {
     testCustomIdIndexesMixed();
     testTransactions();
     testThreads();
+    testUpdateCasting();
+    testQueryFeatures();
+    testPopulateFeatures();
+    testStaticsHooksDocs();
+    testModelExtras();
     disconnect();
     CHECK(!connected());
 

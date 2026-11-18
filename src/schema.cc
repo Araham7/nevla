@@ -3,7 +3,6 @@
 #include <algorithm>
 #include <cmath>
 #include <random>
-#include <regex>
 
 namespace nevla {
 
@@ -21,27 +20,51 @@ Field &Field::defFn(std::function<Value()> make) {
     defaultFn_ = std::move(make);
     return *this;
 }
-Field &Field::enumOf(std::vector<Value> allowed) {
+Field &Field::enumOf(std::vector<Value> allowed, std::string message) {
     enum_ = std::move(allowed);
+    enumMessage_ = std::move(message);
     return *this;
 }
-Field &Field::min(double v) {
+Field &Field::min(double v, std::string message) {
     min_ = v;
+    minIsDate_ = false;
+    minMessage_ = std::move(message);
     return *this;
 }
-Field &Field::max(double v) {
+Field &Field::max(double v, std::string message) {
     max_ = v;
+    maxIsDate_ = false;
+    maxMessage_ = std::move(message);
     return *this;
 }
-Field &Field::minLength(size_t n) {
+Field &Field::min(Date d, std::string message) {
+    min_ = static_cast<double>(d.ms);
+    minIsDate_ = true;
+    minMessage_ = std::move(message);
+    return *this;
+}
+Field &Field::max(Date d, std::string message) {
+    max_ = static_cast<double>(d.ms);
+    maxIsDate_ = true;
+    maxMessage_ = std::move(message);
+    return *this;
+}
+Field &Field::minLength(size_t n, std::string message) {
     minLength_ = n;
+    minLengthMessage_ = std::move(message);
     return *this;
 }
-Field &Field::maxLength(size_t n) {
+Field &Field::maxLength(size_t n, std::string message) {
     maxLength_ = n;
+    maxLengthMessage_ = std::move(message);
     return *this;
 }
 Field &Field::match(std::string regex, std::string message) {
+    try {
+        regex_ = std::make_shared<const std::regex>(regex, std::regex::ECMAScript);
+    } catch (const std::regex_error &e) {
+        throw Error("nevla: invalid regex in match(\"" + regex + "\"): " + e.what());
+    }
     match_ = std::move(regex);
     matchMessage_ = std::move(message);
     return *this;
@@ -66,6 +89,14 @@ Field &Field::index(bool on) {
     index_ = on;
     return *this;
 }
+Field &Field::sparse(bool on) {
+    sparse_ = on;
+    return *this;
+}
+Field &Field::expires(int64_t seconds) {
+    expires_ = seconds;
+    return *this;
+}
 Field &Field::select(bool on) {
     select_ = on;
     return *this;
@@ -80,6 +111,14 @@ Field &Field::validate(std::function<bool(const Value &)> fn, std::string messag
 }
 Field &Field::set(std::function<Value(const Value &)> fn) {
     setter_ = std::move(fn);
+    return *this;
+}
+Field &Field::get(std::function<Value(const Value &)> fn) {
+    getter_ = std::move(fn);
+    return *this;
+}
+Field &Field::alias(std::string name) {
+    alias_ = std::move(name);
     return *this;
 }
 Field &Field::ref(std::string modelName) {
@@ -114,6 +153,11 @@ Field Object(const Schema &schema) {
     f.schema_ = std::make_shared<Schema>(schema);
     return f;
 }
+Field Map(Field of) {
+    Field f = make(FieldType::Map);
+    f.of_ = std::make_shared<Field>(std::move(of));
+    return f;
+}
 
 /* ---------------- Schema ---------------- */
 Schema::Schema(std::initializer_list<std::pair<std::string, Field>> fields, SchemaOptions opts)
@@ -131,16 +175,29 @@ Schema &Schema::add(const std::string &name, Field field) {
     return *this;
 }
 
+template <class M>
+static void mergeHooks(M &into, const M &from) {
+    for (const auto &h : from) into[h.first].insert(into[h.first].end(), h.second.begin(), h.second.end());
+}
+
 Schema &Schema::add(const Schema &other) {
     for (const auto &f : other.fields_) add(f.first, f.second);
     for (const auto &i : other.indexes_) indexes_.push_back(i);
-    for (const auto &h : other.preDoc_) preDoc_[h.first].insert(preDoc_[h.first].end(), h.second.begin(), h.second.end());
-    for (const auto &h : other.postDoc_)
-        postDoc_[h.first].insert(postDoc_[h.first].end(), h.second.begin(), h.second.end());
-    for (const auto &h : other.preQuery_)
-        preQuery_[h.first].insert(preQuery_[h.first].end(), h.second.begin(), h.second.end());
+    mergeHooks(preDoc_, other.preDoc_);
+    mergeHooks(postDoc_, other.postDoc_);
+    mergeHooks(preQuery_, other.preQuery_);
+    mergeHooks(postQuery_, other.postQuery_);
     for (const auto &v : other.virtuals_) virtuals_.push_back(v);
+    for (const auto &v : other.virtualPopulates_) virtualPopulates_.push_back(v);
     for (const auto &m : other.methods_) methods_[m.first] = m.second;
+    for (const auto &m : other.statics_) statics_[m.first] = m.second;
+    if (!jsonTransform_ && other.jsonTransform_) jsonTransform_ = other.jsonTransform_;
+    return *this;
+}
+
+Schema &Schema::remove(const std::string &name) {
+    fields_.erase(std::remove_if(fields_.begin(), fields_.end(), [&](const auto &f) { return f.first == name; }),
+                  fields_.end());
     return *this;
 }
 
@@ -160,12 +217,34 @@ Schema &Schema::pre(const std::string &hook, QueryHook fn) {
     preQuery_[hook].push_back(std::move(fn));
     return *this;
 }
+Schema &Schema::post(const std::string &hook, QueryPostHook fn) {
+    postQuery_[hook].push_back(std::move(fn));
+    return *this;
+}
 Schema &Schema::virtual_(const std::string &name, std::function<Value(const Document &)> getter) {
     virtuals_.emplace_back(name, std::move(getter));
     return *this;
 }
+Schema &Schema::virtualPopulate(const std::string &name, VirtualPopulate opts) {
+    if (opts.ref.empty() || opts.localField.empty() || opts.foreignField.empty())
+        throw Error("nevla: virtualPopulate(\"" + name + "\") needs ref, localField and foreignField");
+    virtualPopulates_.emplace_back(name, std::move(opts));
+    return *this;
+}
 Schema &Schema::method(const std::string &name, std::function<Value(Document &, const Value &)> fn) {
     methods_[name] = std::move(fn);
+    return *this;
+}
+Schema &Schema::static_(const std::string &name, StaticFn fn) {
+    statics_[name] = std::move(fn);
+    return *this;
+}
+Schema &Schema::plugin(const std::function<void(Schema &)> &fn) {
+    fn(*this);
+    return *this;
+}
+Schema &Schema::plugin(const std::function<void(Schema &, const Value &)> &fn, const Value &opts) {
+    fn(*this, opts);
     return *this;
 }
 Schema &Schema::toJSON(std::function<void(const Document &, Value &)> transform) {
@@ -185,29 +264,53 @@ const Field *Schema::field(const std::string &name) const {
     static const Field idField = Id();
     static const Field dateField = DateTime();
     if (name == "_id") return &idField;
-    if (options.timestamps && (name == "createdAt" || name == "updatedAt")) return &dateField;
+    if (options.timestamps && (name == options.createdAt || name == options.updatedAt)) return &dateField;
     return nullptr;
 }
+
+std::string Schema::resolveAlias(std::string_view p) const {
+    auto dot = p.find('.');
+    std::string_view head = p.substr(0, dot);
+    for (const auto &f : fields_)
+        if (!f.second.alias_.empty() && f.second.alias_ == head)
+            return f.first + (dot == std::string_view::npos ? "" : std::string(p.substr(dot)));
+    return std::string(p);
+}
+
+namespace {
+bool isNumeric(const std::string &seg) {
+    return !seg.empty() && std::all_of(seg.begin(), seg.end(), [](char c) { return c >= '0' && c <= '9'; });
+}
+// Array position in a path: "0", "$", "$[]", "$[elem]"
+bool isPosition(const std::string &seg) {
+    return isNumeric(seg) || seg == "$" || (seg.size() >= 3 && seg[0] == '$' && seg[1] == '[' && seg.back() == ']');
+}
+}  // namespace
 
 const Field *Schema::path(std::string_view dotted, bool *underMixed) const {
     static const Field mixed = Mixed();
     if (underMixed) *underMixed = false;
-    const Schema *sc = this;   // abhi kis schema ke andar hain (ya nullptr = field "f" ke andar)
+    const Schema *sc = this;  // inside which schema we are (nullptr = inside field f)
     const Field *f = nullptr;
     for (;;) {
         auto dot = dotted.find('.');
         std::string seg(dotted.substr(0, dot));
         bool last = dot == std::string_view::npos;
-        bool numeric = !seg.empty() && std::all_of(seg.begin(), seg.end(), [](char c) { return c >= '0' && c <= '9'; });
         if (sc) {
             f = sc->field(seg);
+            if (!f) {
+                std::string real = sc->resolveAlias(seg);
+                if (real != seg) f = sc->field(real);
+            }
             if (!f) return nullptr;
             sc = nullptr;
         } else if (f->type == FieldType::Mixed) {
             if (underMixed) *underMixed = true;
             return f;
-        } else if (f->type == FieldType::Array && numeric) {
-            if (f->schema_) {  // "items.0" = poora sub-document
+        } else if (f->type == FieldType::Map) {
+            f = f->of_ ? f->of_.get() : &mixed;  // "prices.inr" -> value type
+        } else if (f->type == FieldType::Array && isPosition(seg)) {
+            if (f->schema_) {  // "items.0" = a whole sub-document
                 if (last) {
                     if (underMixed) *underMixed = true;
                     return &mixed;
@@ -245,15 +348,26 @@ namespace detail {
 namespace {
 const char *typeName(FieldType t) {
     switch (t) {
-        case FieldType::String: return "String";
-        case FieldType::Number: return "Number";
-        case FieldType::Int: return "Int";
-        case FieldType::Boolean: return "Boolean";
-        case FieldType::Date: return "Date";
-        case FieldType::ObjectId: return "ObjectId";
-        case FieldType::Array: return "Array";
-        case FieldType::Object: return "Object";
-        default: return "Mixed";
+        case FieldType::String:
+            return "String";
+        case FieldType::Number:
+            return "Number";
+        case FieldType::Int:
+            return "Int";
+        case FieldType::Boolean:
+            return "Boolean";
+        case FieldType::Date:
+            return "Date";
+        case FieldType::ObjectId:
+            return "ObjectId";
+        case FieldType::Array:
+            return "Array";
+        case FieldType::Object:
+            return "Object";
+        case FieldType::Map:
+            return "Map";
+        default:
+            return "Mixed";
     }
 }
 
@@ -272,23 +386,45 @@ std::string trimmed(const std::string &s) {
 bool parseNumber(const std::string &s, double &out) {
     std::string t = trimmed(s);
     if (t.empty()) return false;
+    // strtod would also accept "0x10", "inf", "nan": MongoDB / Mongoose do not
+    if (t.find_first_of("xXnNiI") != std::string::npos) return false;
     char *end = nullptr;
     out = std::strtod(t.c_str(), &end);
     return end && *end == '\0' && std::isfinite(out);
 }
+
+void addError(std::map<std::string, std::string> &errors, std::map<std::string, std::string> *kinds,
+              const std::string &path, const std::string &kind, const std::string &msg) {
+    errors[path] = msg;
+    if (kinds) (*kinds)[path] = kind;
+}
 }  // namespace
+
+std::string formatMessage(std::string msg, const std::string &path, const Value *value) {
+    auto replaceAll = [&](const std::string &from, const std::string &to) {
+        for (size_t pos = 0; (pos = msg.find(from, pos)) != std::string::npos; pos += to.size())
+            msg.replace(pos, from.size(), to);
+    };
+    replaceAll("{PATH}", path);
+    replaceAll("{VALUE}", value ? value->str() : "");
+    return msg;
+}
 
 Value castValue(const Field &f, const Value &v, const std::string &path) {
     if (v.isNull()) return v;
     Value out;
     switch (f.type) {
-        case FieldType::Mixed: out = v; break;
+        case FieldType::Mixed:
+            out = v;
+            break;
         case FieldType::String: {
             if (v.isArray() || v.isObject()) castFail(f, v, path);
             std::string s = v.str();
             if (f.trim_) s = trimmed(s);
-            if (f.lowercase_) std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
-            if (f.uppercase_) std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::toupper(c); });
+            if (f.lowercase_)
+                std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::tolower(c); });
+            if (f.uppercase_)
+                std::transform(s.begin(), s.end(), s.begin(), [](unsigned char c) { return std::toupper(c); });
             out = std::move(s);
             break;
         }
@@ -305,6 +441,7 @@ Value castValue(const Field &f, const Value &v, const std::string &path) {
                 d = v.asBool() ? 1 : 0;
             else if (!v.isString() || !parseNumber(v.asString(), d))
                 castFail(f, v, path);
+            if (!std::isfinite(d)) castFail(f, v, path);
             bool whole = std::floor(d) == d && std::fabs(d) < 9.007199254740992e15;
             if (f.type == FieldType::Int && !whole) castFail(f, v, path);
             out = (whole && !v.isDouble()) || f.type == FieldType::Int ? Value(static_cast<int64_t>(d)) : Value(d);
@@ -342,7 +479,7 @@ Value castValue(const Field &f, const Value &v, const std::string &path) {
             else if (v.isString() && ObjectId::isValid(v.asString()))
                 out = ObjectId(v.asString());
             else if (v.isObject() && v.contains("_id"))
-                out = castValue(f, v["_id"], path);  // populated document -> uski id
+                out = castValue(f, v["_id"], path);  // populated document -> its id
             else
                 castFail(f, v, path);
             break;
@@ -366,7 +503,7 @@ Value castValue(const Field &f, const Value &v, const std::string &path) {
                 size_t i = 0;
                 for (const auto &e : v.elements()) one(e, i++);
             } else {
-                one(v, 0);  // akeli value -> [value] (Mongoose jaisa)
+                one(v, 0);  // single value -> [value] (like Mongoose)
             }
             out = std::move(arr);
             break;
@@ -376,26 +513,54 @@ Value castValue(const Field &f, const Value &v, const std::string &path) {
             out = f.schema_ ? castObject(*f.schema_, v, path + ".") : v;
             break;
         }
+        case FieldType::Map: {
+            if (!v.isObject()) castFail(f, v, path);
+            Value m = Value::object();
+            for (const auto &kv : v.items()) {
+                if (kv.first.empty() || kv.first[0] == '$' || kv.first.find('.') != std::string::npos)
+                    throw CastError(path, "Map keys cannot be empty, start with '$' or contain '.' (got \"" + kv.first +
+                                              "\" at path `" + path + "`)");
+                m[kv.first] = f.of_ ? castValue(*f.of_, kv.second, path + "." + kv.first) : kv.second;
+            }
+            out = std::move(m);
+            break;
+        }
     }
     if (f.setter_) out = f.setter_(out);
     return out;
 }
 
-Value castObject(const Schema &s, const Value &obj, const std::string &prefix) {
+Value castObject(const Schema &s, const Value &obj, const std::string &prefix,
+                 std::map<std::string, std::string> *castErrors) {
     Value out = Value::object();
     if (!obj.isObject()) return out;
     for (const auto &m : obj.items()) {
         if (m.first == "_id" && !s.hasOwnId()) {
-            // schema me _id nahi likha: 24-hex string -> ObjectId, baaki jaisa hai waisa
+            // _id not declared in the schema: 24-hex string -> ObjectId, anything else as is
             bool hex = m.second.isString() && ObjectId::isValid(m.second.asString());
             out["_id"] = hex ? Value(ObjectId(m.second.asString())) : m.second;
             continue;
         }
-        if (const Field *f = s.field(m.first))
-            out[m.first] = castValue(*f, m.second, prefix + m.first);
-        else if (!s.options.strict || m.first == s.options.versionKey || m.first == s.options.discriminatorKey)
-            out[m.first] = m.second;
-        // strict: anjaan key chhod di
+        std::string key = m.first;
+        const Field *f = s.field(key);
+        if (!f) {  // alias?
+            std::string real = s.resolveAlias(key);
+            if (real != key && (f = s.field(real))) key = real;
+        }
+        if (f) {
+            if (!castErrors) {
+                out[key] = castValue(*f, m.second, prefix + key);
+                continue;
+            }
+            try {
+                out[key] = castValue(*f, m.second, prefix + key);
+            } catch (const CastError &e) {
+                (*castErrors)[e.path.empty() ? prefix + key : e.path] = e.what();
+            }
+        } else if (!s.options.strict || key == s.options.versionKey || key == s.options.discriminatorKey) {
+            out[key] = m.second;
+        }
+        // strict: unknown key dropped
     }
     return out;
 }
@@ -423,73 +588,97 @@ void applyDefaults(const Schema &s, Value &obj) {
     }
 }
 
-void validateValue(const Field &f, const Value *v, const std::string &path, std::map<std::string, std::string> &errors) {
+void validateValue(const Field &f, const Value *v, const std::string &path, std::map<std::string, std::string> &errors,
+                   std::map<std::string, std::string> *kinds) {
+    auto fail = [&](const std::string &kind, const std::string &custom, const std::string &fallback) {
+        addError(errors, kinds, path, kind, custom.empty() ? fallback : formatMessage(custom, path, v));
+    };
     bool missing = !v || v->isNull() || (f.type == FieldType::String && v->isString() && v->asString().empty()) ||
                    (f.type == FieldType::Array && v->isArray() && v->elements().empty() && f.required_);
     if (missing) {
-        if (f.required_)
-            errors[path] = f.requiredMessage_.empty() ? "Path `" + path + "` is required." : f.requiredMessage_;
+        if (f.required_) fail("required", f.requiredMessage_, "Path `" + path + "` is required.");
         return;
     }
     if (!f.enum_.empty() && std::find(f.enum_.begin(), f.enum_.end(), *v) == f.enum_.end()) {
-        errors[path] = "`" + v->str() + "` is not a valid enum value for path `" + path + "`.";
+        fail("enum", f.enumMessage_, "`" + v->str() + "` is not a valid enum value for path `" + path + "`.");
         return;
     }
+    if (v->isDate() && (f.minIsDate_ || f.maxIsDate_)) {
+        double ms = static_cast<double>(v->asDate().ms);
+        if (f.min_ && f.minIsDate_ && ms < *f.min_)
+            fail("min", f.minMessage_,
+                 "Path `" + path + "` (" + v->str() + ") is before minimum allowed value (" +
+                     Date{static_cast<int64_t>(*f.min_)}.iso() + ").");
+        if (f.max_ && f.maxIsDate_ && ms > *f.max_)
+            fail("max", f.maxMessage_,
+                 "Path `" + path + "` (" + v->str() + ") is after maximum allowed value (" +
+                     Date{static_cast<int64_t>(*f.max_)}.iso() + ").");
+    }
     if (v->isNumber()) {
-        if (f.min_ && v->asDouble() < *f.min_)
-            errors[path] = "Path `" + path + "` (" + v->str() + ") is less than minimum allowed value (" +
-                           Value(*f.min_).str() + ").";
-        if (f.max_ && v->asDouble() > *f.max_)
-            errors[path] = "Path `" + path + "` (" + v->str() + ") is more than maximum allowed value (" +
-                           Value(*f.max_).str() + ").";
+        if (f.min_ && !f.minIsDate_ && v->asDouble() < *f.min_)
+            fail("min", f.minMessage_,
+                 "Path `" + path + "` (" + v->str() + ") is less than minimum allowed value (" + Value(*f.min_).str() +
+                     ").");
+        if (f.max_ && !f.maxIsDate_ && v->asDouble() > *f.max_)
+            fail("max", f.maxMessage_,
+                 "Path `" + path + "` (" + v->str() + ") is more than maximum allowed value (" + Value(*f.max_).str() +
+                     ").");
     }
     if (v->isString()) {
         const std::string &s = v->asString();
         if (f.minLength_ && s.size() < *f.minLength_)
-            errors[path] = "Path `" + path + "` (`" + s + "`) is shorter than the minimum allowed length (" +
-                           std::to_string(*f.minLength_) + ").";
+            fail("minlength", f.minLengthMessage_,
+                 "Path `" + path + "` (`" + s + "`) is shorter than the minimum allowed length (" +
+                     std::to_string(*f.minLength_) + ").");
         if (f.maxLength_ && s.size() > *f.maxLength_)
-            errors[path] = "Path `" + path + "` (`" + s + "`) is longer than the maximum allowed length (" +
-                           std::to_string(*f.maxLength_) + ").";
-        if (!f.match_.empty()) {
-            bool ok = false;
-            try {
-                ok = std::regex_search(s, std::regex(f.match_));
-            } catch (const std::regex_error &) {
-                errors[path] = "Schema ka regex galat hai for path `" + path + "`: " + f.match_;
-                return;
-            }
-            if (!ok) errors[path] = f.matchMessage_.empty() ? "Path `" + path + "` is invalid (" + s + ")." : f.matchMessage_;
-        }
+            fail("maxlength", f.maxLengthMessage_,
+                 "Path `" + path + "` (`" + s + "`) is longer than the maximum allowed length (" +
+                     std::to_string(*f.maxLength_) + ").");
+        if (f.regex_ && !std::regex_search(s, *f.regex_))
+            fail("regexp", f.matchMessage_, "Path `" + path + "` is invalid (" + s + ").");
     }
-    for (const auto &val : f.validators_)
-        if (!val.first(*v))
-            errors[path] = val.second.empty() ? "Validator failed for path `" + path + "` with value `" + v->str() + "`"
-                                              : val.second;
+    for (const auto &val : f.validators_) {
+        bool ok = false;
+        try {
+            ok = val.first(*v);
+        } catch (const std::exception &e) {  // validator threw: treat as failed with its message
+            fail("user defined", val.second, e.what());
+            continue;
+        }
+        if (!ok)
+            fail("user defined", val.second, "Validator failed for path `" + path + "` with value `" + v->str() + "`");
+    }
     if (f.type == FieldType::Array && v->isArray()) {
         size_t i = 0;
         for (const auto &e : v->elements()) {
             std::string p = path + "." + std::to_string(i++);
             if (f.schema_)
-                validateObject(*f.schema_, e, p + ".", errors);
+                validateObject(*f.schema_, e, p + ".", errors, kinds);
             else if (f.of_)
-                validateValue(*f.of_, &e, p, errors);
+                validateValue(*f.of_, &e, p, errors, kinds);
         }
     }
-    if (f.type == FieldType::Object && f.schema_ && v->isObject()) validateObject(*f.schema_, *v, path + ".", errors);
+    if (f.type == FieldType::Map && v->isObject() && f.of_)
+        for (const auto &kv : v->items()) validateValue(*f.of_, &kv.second, path + "." + kv.first, errors, kinds);
+    if (f.type == FieldType::Object && f.schema_ && v->isObject())
+        validateObject(*f.schema_, *v, path + ".", errors, kinds);
 }
 
 void validateObject(const Schema &s, const Value &obj, const std::string &prefix,
-                    std::map<std::string, std::string> &errors) {
+                    std::map<std::string, std::string> &errors, std::map<std::string, std::string> *kinds) {
     for (const auto &kv : s.fields()) {
         const Value *v = obj.find(kv.first);
         if (kv.second.type == FieldType::Object && kv.second.schema_ && !v) {
-            // nested object hi nahi hai: uske required fields check karo
-            validateObject(*kv.second.schema_, Value::object(), prefix + kv.first + ".", errors);
-            if (kv.second.required_) errors[prefix + kv.first] = "Path `" + prefix + kv.first + "` is required.";
+            // nested object missing: still check its required fields
+            validateObject(*kv.second.schema_, Value::object(), prefix + kv.first + ".", errors, kinds);
+            if (kv.second.required_)
+                addError(errors, kinds, prefix + kv.first, "required",
+                         kv.second.requiredMessage_.empty()
+                             ? "Path `" + prefix + kv.first + "` is required."
+                             : formatMessage(kv.second.requiredMessage_, prefix + kv.first, nullptr));
             continue;
         }
-        validateValue(kv.second, v, prefix + kv.first, errors);
+        validateValue(kv.second, v, prefix + kv.first, errors, kinds);
     }
 }
 
@@ -499,6 +688,25 @@ void hiddenPaths(const Schema &s, const std::string &prefix, std::vector<std::st
             out.push_back(prefix + kv.first);
         else if (kv.second.type == FieldType::Object && kv.second.schema_)
             hiddenPaths(*kv.second.schema_, prefix + kv.first + ".", out);
+    }
+}
+
+void applyGetters(const Schema &s, Value &obj) {
+    if (!obj.isObject()) return;
+    for (const auto &kv : s.fields()) {
+        Value *v = obj.find(kv.first);
+        if (!v) continue;
+        const Field &f = kv.second;
+        if (f.type == FieldType::Object && f.schema_) applyGetters(*f.schema_, *v);
+        if (f.type == FieldType::Array && f.schema_)
+            for (auto &e : v->elements()) applyGetters(*f.schema_, e);
+        if ((f.type == FieldType::Array || f.type == FieldType::Map) && f.of_ && f.of_->getter_) {
+            if (v->isArray())
+                for (auto &e : v->elements()) e = f.of_->getter_(e);
+            if (v->isObject())
+                for (auto &m : v->items()) m.second = f.of_->getter_(m.second);
+        }
+        if (f.getter_) *v = f.getter_(*v);
     }
 }
 

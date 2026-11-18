@@ -1,6 +1,6 @@
 #pragma once
-/* nevla::Value — JSON/BSON jaisa dynamic value (null, bool, int, double, string, Date, ObjectId, array, object).
-   Object me keys ka order wahi rehta hai jis order me daale gaye.
+/* nevla::Value — a dynamic JSON/BSON-like value (null, bool, int, double, string, Date, ObjectId, array, object).
+   Objects keep their keys in insertion order (like BSON documents).
 
      Value user = {{"name", "Asha"}, {"age", 21}, {"tags", {"a", "b"}}};   // object
      Value list = {1, 2, 3};                                              // array
@@ -10,6 +10,7 @@
 #include <concepts>
 #include <cstdint>
 #include <initializer_list>
+#include <map>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -20,7 +21,7 @@
 
 namespace nevla {
 
-// Sab nevla errors ka base
+// Base class of every nevla error
 class Error : public std::runtime_error {
   public:
     using std::runtime_error::runtime_error;
@@ -39,7 +40,7 @@ struct Date {
 class ObjectId {
   public:
     ObjectId() = default;
-    explicit ObjectId(std::string hex);  // galat ho to nevla::Error
+    explicit ObjectId(std::string hex);  // throws nevla::Error if not 24 hex chars
     static ObjectId generate();
     static bool isValid(std::string_view hex);
     const std::string &str() const { return hex_; }
@@ -75,15 +76,15 @@ class Value {
     template <class T>
     Value(const std::vector<T> &items);
     template <class T>
-    Value(T *) = delete;  // pointer galti se bool na ban jaye
+    Value(T *) = delete;  // so a pointer never silently becomes a bool
     /* {{"key", value}, ...} = object;  {a, b, c} = array.
-       (Har element 2-item array ho jiska pehla item string ho to object mana jata hai.
-        Aise pairs ka ARRAY chahiye to Value::array({...}) use karo.) */
+       (If every element is a 2-item array whose first item is a string, it is treated as an object.
+        For an ARRAY of such pairs use Value::array({...}).) */
     Value(std::initializer_list<Value> init);
 
-    static Value object();                                   // {}
+    static Value object();                                        // {}
     static Value array(std::initializer_list<Value> items = {});  // [] ya [..] (hamesha array)
-    static Value parse(std::string_view json);               // JSON text -> Value (galat ho to Error)
+    static Value parse(std::string_view json);                    // JSON text (Extended JSON ok) -> Value; throws Error
 
     Type type() const { return static_cast<Type>(v_.index()); }
     bool isNull() const { return type() == Type::Null; }
@@ -97,42 +98,42 @@ class Value {
     bool isArray() const { return type() == Type::Array; }
     bool isObject() const { return type() == Type::Object; }
 
-    // Lenient getters (type alag ho to jitna ho sake convert, warna fallback)
+    // Lenient getters (convert when possible, otherwise return the fallback)
     bool asBool(bool fallback = false) const;
     int64_t asInt(int64_t fallback = 0) const;
     double asDouble(double fallback = 0) const;
-    const std::string &asString() const;  // string na ho to ""
-    std::string str() const;              // kisi bhi scalar ka text ("42", "true", ObjectId hex, ISO date)
+    const std::string &asString() const;  // "" if not a string
+    std::string str() const;              // text of any scalar ("42", "true", ObjectId hex, ISO date)
     Date asDate() const;
     ObjectId asObjectId() const;
     template <class T>
     T as() const;  // as<int>(), as<std::string>(), as<std::vector<std::string>>(), as<MyStruct>() (NEVLA_STRUCT)
 
     // Object
-    Value &operator[](const std::string &key);              // na ho to bana deta hai (null -> object)
-    const Value &operator[](const std::string &key) const;  // na ho to null
+    Value &operator[](const std::string &key);              // creates the key if missing (null -> object)
+    const Value &operator[](const std::string &key) const;  // null if missing
     Value *find(std::string_view key);
     const Value *find(std::string_view key) const;
     bool contains(std::string_view key) const { return find(key) != nullptr; }
     bool erase(std::string_view key);
-    Object &items() &;              // object ke (key, value) pairs
-    const Object &items() const &;  // object na ho to khaali
-    Object items() &&;              // temporary par: copy (taaki `for (auto &kv : doc.get("x").items())` safe rahe)
+    Object &items() &;              // (key, value) pairs of an object
+    const Object &items() const &;  // empty if not an object
+    Object items() &&;              // on a temporary: a copy (so `for (auto &kv : doc.get("x").items())` is safe)
 
     // Array
-    void push_back(Value v);  // null -> array
+    void push_back(Value v);  // null becomes an array
     Value &at(size_t i);
     const Value &at(size_t i) const;
     Array &elements() &;
-    const Array &elements() const &;  // array na ho to khaali
-    Array elements() &&;              // temporary par: copy (range-for me safe)
+    const Array &elements() const &;  // empty if not an array
+    Array elements() &&;              // on a temporary: a copy (safe in range-for)
 
-    size_t size() const;  // array / object ke items, string ki length, baaki 0
+    size_t size() const;  // items of array / object, length of string, otherwise 0
     bool empty() const { return size() == 0; }
 
     // Dotted path: "address.city", "tags.0"
-    const Value *path(std::string_view dotted) const;  // na mile to nullptr
-    Value &pathRef(std::string_view dotted);           // raste me objects bana deta hai
+    const Value *path(std::string_view dotted) const;  // nullptr if missing
+    Value &pathRef(std::string_view dotted);           // creates objects on the way
     bool erasePath(std::string_view dotted);
 
     bool operator==(const Value &other) const;
@@ -142,7 +143,7 @@ class Value {
     std::variant<std::monostate, bool, int64_t, double, std::string, Date, ObjectId, Array, Object> v_;
 };
 
-/* ---- C++ types <-> Value (as<T>() / toValue() / NEVLA_STRUCT isi se chalte hain) ---- */
+/* ---- C++ types <-> Value (as<T>() / toValue() / NEVLA_STRUCT are built on these) ---- */
 inline void from_value(const Value &v, Value &out) { out = v; }
 inline void from_value(const Value &v, std::string &out) { out = v.str(); }
 inline void from_value(const Value &v, bool &out) { out = v.asBool(); }
@@ -166,6 +167,15 @@ void from_value(const Value &v, std::vector<T> &out) {
         T item{};
         from_value(e, item);
         out.push_back(std::move(item));
+    }
+}
+template <class T>
+void from_value(const Value &v, std::map<std::string, T> &out) {
+    out.clear();
+    for (const auto &kv : v.items()) {
+        T item{};
+        from_value(kv.second, item);
+        out.emplace(kv.first, std::move(item));
     }
 }
 template <class T>
@@ -194,6 +204,15 @@ void to_value(Value &out, const std::vector<T> &in) {
         Value item;
         to_value(item, e);
         out.push_back(std::move(item));
+    }
+}
+template <class T>
+void to_value(Value &out, const std::map<std::string, T> &in) {
+    out = Value::object();
+    for (const auto &kv : in) {
+        Value item;
+        to_value(item, kv.second);
+        out[kv.first] = std::move(item);
     }
 }
 template <class T>

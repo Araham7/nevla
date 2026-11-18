@@ -1,0 +1,70 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler: [gcc, clang]
+    env:
+      MONGOCXX_VERSION: 3.10.2
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake clang libmongoc-dev libbson-dev libssl-dev
+
+      - name: Cache mongocxx
+        id: cache-mongocxx
+        uses: actions/cache@v4
+        with:
+          path: /opt/mongocxx
+          key: mongocxx-${{ env.MONGOCXX_VERSION }}-${{ runner.os }}-ubuntu-24.04
+
+      - name: Build mongocxx
+        if: steps.cache-mongocxx.outputs.cache-hit != 'true'
+        run: |
+          curl -sSL -o drv.tar.gz https://github.com/mongodb/mongo-cxx-driver/releases/download/r${MONGOCXX_VERSION}/mongo-cxx-driver-r${MONGOCXX_VERSION}.tar.gz
+          tar xzf drv.tar.gz
+          cmake -S mongo-cxx-driver-r${MONGOCXX_VERSION} -B drv-build -DCMAKE_BUILD_TYPE=Release \
+                -DCMAKE_CXX_STANDARD=17 -DCMAKE_INSTALL_PREFIX=/opt/mongocxx
+          cmake --build drv-build -j$(nproc)
+          sudo cmake --install drv-build
+
+      - name: Start MongoDB (single-node replica set)
+        run: |
+          docker run -d --name mongo -p 27017:27017 mongo:7 --replSet rs0 --bind_ip_all
+          for i in $(seq 1 30); do
+            docker exec mongo mongosh --quiet --eval 'db.runCommand({ping:1})' && break
+            sleep 1
+          done
+          docker exec mongo mongosh --quiet --eval 'rs.initiate({_id:"rs0",members:[{_id:0,host:"127.0.0.1:27017"}]})'
+          sleep 5
+
+      - name: Configure
+        run: |
+          if [ "${{ matrix.compiler }}" = "clang" ]; then export CXX=clang++; else export CXX=g++; fi
+          cmake -B build -DCMAKE_BUILD_TYPE=Debug -DCMAKE_PREFIX_PATH=/opt/mongocxx \
+                -DCMAKE_CXX_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer"
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Test
+        env:
+          LD_LIBRARY_PATH: /opt/mongocxx/lib
+          NEVLA_TEST_URI: mongodb://127.0.0.1:27017/?directConnection=true
+        run: ./build/nevla_tests
+
+      - name: Examples
+        env:
+          LD_LIBRARY_PATH: /opt/mongocxx/lib
+        run: |
+          for e in 01_quickstart 02_blog 03_iot 04_typed_struct 05_features; do ./build/$e > /dev/null; done

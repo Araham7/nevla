@@ -7,11 +7,13 @@
 #include <iostream>
 #include <mutex>
 #include <nevla/nevla.hpp>
+#include <random>
 #include <thread>
 
 using namespace nevla;
 
 static int passed = 0, failed = 0;
+static bool gMemory = false;  // running on connect("memory://..."): skip checks that need a real server
 #define CHECK(cond)                                                                      \
     do {                                                                                 \
         if (cond)                                                                        \
@@ -783,7 +785,10 @@ static void testQueryFeatures() {
     CHECK(Q.where("tags").size(2).count() == 8);
     CHECK(Q.where("tags").all({"a", "b"}).count() == 8);
     CHECK(Q.find().where({{"name", "Odd"}}).where("n").lt(5).count() == 2);
-    CHECK(Q.find({{"name", "odd"}}).collation({{"locale", "en"}, {"strength", 2}}).count() == 13);
+    if (!gMemory)
+        CHECK(Q.find({{"name", "odd"}}).collation({{"locale", "en"}, {"strength", 2}}).count() == 13);
+    else
+        CHECK_THROWS(Q.find({{"name", "odd"}}).collation({{"locale", "en"}}).count(), Error);  // never silently ignored
     CHECK(Q.find().sort("-n").limit(1).maxTimeMS(5000).comment("t").hint("_id_").exec()[0]["n"].asInt() == 25);
 
     int seen = 0;
@@ -1459,8 +1464,12 @@ static void testV04Db() {
           authors[2]["postCount"].asInt() == 0);
 
     // explain / plan
-    CHECK(Post.aggregate().match("qty > 1").plan().find("IXSCAN(qty_1)") != std::string::npos);
-    CHECK(Post.aggregate().match("price > 1").plan().find("COLLSCAN") != std::string::npos);
+    if (!gMemory) {
+        CHECK(Post.aggregate().match("qty > 1").plan().find("IXSCAN(qty_1)") != std::string::npos);
+        CHECK(Post.aggregate().match("price > 1").plan().find("COLLSCAN") != std::string::npos);
+    } else {
+        CHECK(Post.aggregate().match("qty > 1").plan() == "MEMORY");
+    }
     CHECK(Post.aggregate().match("qty > 1").explain().isObject());
 
     for (auto M : {Company, Author, Tag, Post}) M.dropCollection();
@@ -2215,15 +2224,600 @@ static void testEncryption() {
     M.dropCollection();
 }
 
+/* ============================ v0.5: migrations, cache ============================ */
+static void testMigrations() {
+    section("migrations");
+    auto U = model("MigUser", Schema({{"name", String()}, {"plan", String()}, {"credits", Int()}}));
+    auto Store = model("MigRaw", Schema({}, {.strict = false}), "nevla_migrations");
+    U.dropCollection();
+    Store.dropCollection();
+    clearMigrations();
+    U.create({{"name", "a"}});
+    U.create({{"name", "b"}});
+    std::vector<std::string> log;
+    migration(
+        "2026-11-20-add-plan",
+        [&] {
+            log.push_back("up1");
+            U.updateMany(Value::object(), {{"plan", "free"}});
+        },
+        [&] {
+            log.push_back("down1");
+            U.updateMany(Value::object(), {{"$unset", {{"plan", ""}}}});
+        });
+    migration(
+        "2026-11-19-credits",
+        [&] {
+            log.push_back("up0");
+            U.updateMany(Value::object(), {{"credits", 10}});
+        },
+        [&] {
+            log.push_back("down0");
+            U.updateMany(Value::object(), {{"$unset", {{"credits", ""}}}});
+        });
+    CHECK_THROWS(migration("2026-11-19-credits", [] {}), Error);  // same id twice
+    CHECK_THROWS(migration("x", nullptr), Error);
+
+    auto ran = migrate();
+    CHECK(ran.size() == 2 && ran[0] == "2026-11-19-credits" && ran[1] == "2026-11-20-add-plan");  // id order
+    CHECK(log.size() == 2 && log[0] == "up0" && log[1] == "up1");
+    CHECK(U.countDocuments({{"plan", "free"}, {"credits", 10}}) == 2);
+    CHECK(migrate().empty() && log.size() == 2);  // already applied: nothing runs twice
+    auto st = migrationStatus();
+    CHECK(st.size() == 2 && st[0].applied && st[1].applied && st[1].at.isDate());
+
+    migration("2026-11-21-boom", [] { throw Error("disk full"); });
+    try {
+        migrate();
+        CHECK(false);
+    } catch (const Error &e) {
+        CHECK(std::string(e.what()).find("2026-11-21-boom") != std::string::npos);
+    }
+    CHECK(!migrationStatus()[2].applied);                   // a failed migration is not recorded
+    CHECK(Store.countDocuments({{"_id", "__lock"}}) == 0);  // the lock was released
+
+    clearMigrations();  // register again without the failing one
+    migration(
+        "2026-11-19-credits", [&] { log.push_back("up0"); },
+        [&] {
+            log.push_back("down0");
+            U.updateMany(Value::object(), {{"$unset", {{"credits", ""}}}});
+        });
+    migration(
+        "2026-11-20-add-plan", [&] { log.push_back("up1"); },
+        [&] {
+            log.push_back("down1");
+            U.updateMany(Value::object(), {{"$unset", {{"plan", ""}}}});
+        });
+    auto undone = rollback();
+    CHECK(undone.size() == 1 && undone[0] == "2026-11-20-add-plan" && U.countDocuments({{"plan", "free"}}) == 0);
+    CHECK(rollback(5).size() == 1 && U.countDocuments({{"credits", 10}}) == 0);
+    CHECK(migrate().size() == 2);  // can run again after a rollback
+
+    // a lock held by another (live) process blocks; an expired lock is taken over
+    Store.create({{"_id", "__lock"}, {"owner", "other"}, {"until", Date{Date::now().ms + 60000}}});
+    CHECK_THROWS(migrate({.lockTimeoutMs = 300}), Error);
+    Store.updateOne({{"_id", "__lock"}}, {{"until", Date{Date::now().ms - 1000}}});
+    CHECK(migrate().empty());
+    // two threads at once: each migration still runs exactly once
+    clearMigrations();
+    std::atomic<int> runs{0};
+    migration("2026-12-01-slow", [&] {
+        runs++;
+        std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    });
+    std::thread t1([] { migrate(); }), t2([] { migrate(); });
+    t1.join();
+    t2.join();
+    CHECK(runs == 1);
+    clearMigrations();
+    U.dropCollection();
+    Store.dropCollection();
+}
+
+static void testCache() {
+    section("findById cache");
+    auto C = model("CacheUser", Schema({{"name", String()}, {"n", Int().def(0)}}));
+    C.dropCollection();
+    auto a = C.create({{"name", "a"}});
+    C.cache({.ttlMs = 60000, .maxEntries = 2});
+    std::vector<std::string> ops;
+    setDebug([&](const std::string &, const std::string &op, const Value &) { ops.push_back(op); });
+    CHECK(C.findById(a._id()).lean().value()["name"].asString() == "a");
+    CHECK(C.findById(a.id()).lean().value()["name"].asString() == "a");  // string id = same entry
+    CHECK(C.findById(a._id()).exec()->get("name").asString() == "a");
+    setDebug(false);
+    CHECK(ops.size() == 1);  // one real query, two answers from memory
+    CacheStats st = C.cacheStats();
+    CHECK(st.hits == 2 && st.misses == 1 && st.size == 1);
+
+    // every way of writing makes the next read fresh
+    C.updateOne({{"_id", a._id()}}, {{"name", "b"}});
+    CHECK(C.findById(a._id()).lean().value()["name"].asString() == "b");
+    auto d = C.findById(a._id()).orFail();
+    d.set("name", "c").save();
+    CHECK(C.findById(a._id()).lean().value()["name"].asString() == "c");
+    C.findOneAndUpdate({{"_id", a._id()}}, {{"$inc", {{"n", 1}}}});
+    CHECK(C.findById(a._id()).lean().value()["n"].asInt() == 1);
+    C.bulkWrite({{{"updateOne", {{"filter", {{"_id", a._id()}}}, {"update", {{"n", 5}}}}}}});
+    CHECK(C.findById(a._id()).lean().value()["n"].asInt() == 5);
+    C.replaceOne({{"_id", a._id()}}, {{"name", "r"}});
+    CHECK(C.findById(a._id()).lean().value()["name"].asString() == "r");
+    C.findById(a._id()).orFail().deleteOne();
+    CHECK(!C.findById(a._id()).lean());
+
+    // queries other than a plain findById, and transactions, skip the cache
+    auto b = C.create({{"name", "x"}});
+    C.findById(b._id()).lean();
+    int64_t misses = C.cacheStats().misses;
+    C.findById(b._id()).select("name").lean();
+    C.findOne({{"name", "x"}}).lean();
+    CHECK(C.cacheStats().misses == misses);
+    // LRU: maxEntries = 2
+    auto e1 = C.create({{"name", "e1"}}), e2 = C.create({{"name", "e2"}});
+    C.findById(e1._id()).lean();
+    C.findById(e2._id()).lean();
+    CHECK(C.cacheStats().size == 2);
+    // ttl
+    C.cache({.ttlMs = 50});
+    C.clearCache();
+    C.findById(b._id()).lean();
+    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    int64_t m0 = C.cacheStats().misses;
+    C.findById(b._id()).lean();
+    CHECK(C.cacheStats().misses == m0 + 1);
+    // concurrent readers and writers never see a stale value after their own write
+    C.cache({.ttlMs = 60000});
+    std::atomic<int> stale{0};
+    std::vector<std::thread> ts;
+    for (int t = 0; t < 4; t++)
+        ts.emplace_back([&, t] {
+            for (int i = 0; i < 30; i++) {
+                std::string v = std::to_string(t) + "-" + std::to_string(i);
+                C.updateOne({{"_id", b._id()}}, {{"name", v}});
+                std::string seen = C.findById(b._id()).lean().value()["name"].asString();
+                if (seen.empty()) stale++;
+            }
+        });
+    for (auto &t : ts) t.join();
+    C.updateOne({{"_id", b._id()}}, {{"name", "final"}});
+    CHECK(stale == 0 && C.findById(b._id()).lean().value()["name"].asString() == "final");
+    // models with findOne middleware never use it (tenant / soft delete safety)
+    Schema sd({{"name", String()}});
+    sd.plugin(plugins::softDelete);
+    auto S = model("CacheSoft", sd);
+    S.dropCollection();
+    S.cache();
+    auto sdoc = S.create({{"name", "s"}});
+    S.findById(sdoc._id()).lean();
+    sdoc.call("softDelete");
+    CHECK(!S.findById(sdoc._id()).lean() && S.cacheStats().hits == 0);
+    C.disableCache();
+    C.dropCollection();
+    S.dropCollection();
+}
+
+/* ============================ v0.5: in-memory database vs real MongoDB ============================ */
+// Canonical text of a result: object keys sorted, numbers compared as doubles (1 == 1.0)
+static std::string canon(const Value &v) {
+    switch (v.type()) {
+        case Value::Type::Int:
+        case Value::Type::Double: {
+            char buf[64];
+            std::snprintf(buf, sizeof buf, "%.10g", v.asDouble());
+            return buf;
+        }
+        case Value::Type::Array: {
+            std::string s = "[";
+            for (const auto &e : v.elements()) s += canon(e) + ",";
+            return s + "]";
+        }
+        case Value::Type::Object: {
+            std::vector<std::pair<std::string, std::string>> kv;
+            for (const auto &m : v.items()) kv.emplace_back(m.first, canon(m.second));
+            std::sort(kv.begin(), kv.end());
+            std::string s = "{";
+            for (auto &p : kv) s += p.first + ":" + p.second + ",";
+            return s + "}";
+        }
+        default:
+            return v.toJson();
+    }
+}
+static std::string canon(const std::vector<Value> &rows) {
+    Value a = Value::array();
+    for (const auto &r : rows) a.push_back(r);
+    return canon(a);
+}
+
+using Outputs = std::vector<std::pair<std::string, std::string>>;
+
+static Outputs diffScenario(unsigned seed) {
+    Outputs out;
+    auto D = model("DiffDoc",
+                   Schema({{"_id", Int()},
+                           {"name", String()},
+                           {"age", Int()},
+                           {"score", Number()},
+                           {"tags", Array(String())},
+                           {"city", String()},
+                           {"active", Boolean()},
+                           {"at", DateTime()},
+                           {"nested", Object(Schema({{"x", Int()}, {"y", String()}}))},
+                           {"items", Array(Schema({{"sku", String()}, {"qty", Int()}}))},
+                           {"code", String().unique().sparse()}},
+                          {.versionKey = ""}),
+                   "diff_docs");
+    auto C = model("DiffCity", Schema({{"_id", String()}, {"state", String()}, {"pop", Int()}}, {.versionKey = ""}),
+                   "diff_cities");
+    D.dropCollection();
+    C.dropCollection();
+    D.createIndexes();
+    C.insertMany({{{"_id", "Kolkata"}, {"state", "WB"}, {"pop", 15}},
+                  {{"_id", "Durgapur"}, {"state", "WB"}, {"pop", 1}},
+                  {{"_id", "Delhi"}, {"state", "DL"}, {"pop", 30}}});
+    std::mt19937 rng(seed);
+    auto pick = [&](int n) { return static_cast<int>(rng() % static_cast<unsigned>(n)); };
+    const char *names[] = {"Asha", "asha", "Bo", "Cy", "Dev", "Esha", "Émile", "zed", "A.B", "मीना"};
+    const char *cities[] = {"Kolkata", "Durgapur", "Delhi", "Pune"};
+    const char *tagset[] = {"cpp", "iot", "js", "db", "x"};
+    std::vector<Value> docs;
+    for (int i = 0; i < 300; i++) {
+        Value d{{"_id", i}};
+        if (pick(10)) d["name"] = names[pick(10)];
+        int r = pick(12);
+        if (r == 0)
+            d["age"] = Value();  // null
+        else if (r > 1)
+            d["age"] = pick(80);  // r == 1: missing
+        if (pick(5)) d["score"] = pick(1000) / 10.0;
+        if (pick(4)) {
+            Value t = Value::array();
+            for (int k = pick(4); k > 0; k--) t.push_back(tagset[pick(5)]);
+            d["tags"] = t;
+        }
+        if (pick(6)) d["city"] = cities[pick(4)];
+        if (pick(3)) d["active"] = pick(2) == 1;
+        d["at"] = Date{Date::parse("2026-11-01T00:00:00Z")->ms + static_cast<int64_t>(pick(30 * 24 * 60)) * 60000};
+        if (pick(2)) d["nested"] = Value{{"x", pick(10)}, {"y", names[pick(10)]}};
+        if (pick(3)) {
+            Value it = Value::array();
+            for (int k = pick(3) + 1; k > 0; k--)
+                it.push_back(Value{{"sku", std::string("s") + std::to_string(pick(5))}, {"qty", pick(6)}});
+            d["items"] = it;
+        }
+        if (i % 7 == 0) d["code"] = "c" + std::to_string(i);
+        docs.push_back(d);
+    }
+    D.insertMany(docs);
+    auto all = [&] { return canon(D.find().sort("_id").lean()); };
+    out.emplace_back("initial", all());
+
+    // ---- hand-written filters: every operator, missing / null / arrays / nested
+    std::vector<Value> filters = {
+        Value::object(),
+        {{"age", 30}},
+        {{"age", nullptr}},
+        {{"age", {{"$ne", nullptr}}}},
+        {{"age", {{"$exists", false}}}},
+        {{"age", {{"$gt", 40}}}},
+        {{"age", {{"$gte", 40}, {"$lt", 60}}}},
+        {{"age", {{"$lte", nullptr}}}},
+        {{"score", {{"$gt", 50.5}}}},
+        {{"name", "asha"}},
+        {{"name", {{"$in", Value::array({"Asha", "Bo", nullptr})}}}},
+        {{"name", {{"$nin", Value::array({"Asha", "Bo"})}}}},
+        {{"name", {{"$regex", "^a"}, {"$options", "i"}}}},
+        {{"name", {{"$regex", "\\."}}}},
+        {{"name", {{"$gt", "Cy"}}}},
+        {{"tags", "cpp"}},
+        {{"tags", Value::array({"cpp", "iot"})}},
+        {{"tags", {{"$all", Value::array({"cpp", "iot"})}}}},
+        {{"tags", {{"$size", 2}}}},
+        {{"tags", {{"$exists", true}}}},
+        {{"tags", {{"$ne", "x"}}}},
+        {{"tags.0", "db"}},
+        {{"city", {{"$in", Value::array({"Kolkata", "Pune"})}}}},
+        {{"active", true}},
+        {{"active", {{"$ne", true}}}},
+        {{"at", {{"$gte", "2026-11-15"}}}},
+        {{"at", {{"$lt", "2026-11-03T12:00:00Z"}}}},
+        {{"nested.x", {{"$gte", 5}}}},
+        {{"nested", {{"$exists", false}}}},
+        {{"items.sku", "s1"}},
+        {{"items.qty", {{"$gt", 4}}}},
+        {{"items", {{"$elemMatch", {{"sku", "s2"}, {"qty", {{"$gte", 3}}}}}}}},
+        {{"items", {{"$size", 1}}}},
+        {{"$or", Value::array({{{"age", {{"$lt", 10}}}}, {{"city", "Delhi"}}})}},
+        {{"$and", Value::array({{{"age", {{"$gt", 20}}}}, {{"age", {{"$lt", 30}}}}})}},
+        {{"$nor", Value::array({{{"active", true}}, {{"city", "Pune"}}})}},
+        {{"age", {{"$not", {{"$gt", 50}}}}}},
+        {{"age", {{"$mod", Value::array({5, 0})}}}},
+        {{"score", {{"$type", "double"}}}},
+        {{"code", {{"$exists", true}}}},
+        {{"$expr", {{"$gt", Value::array({"$score", "$age"})}}}},
+        {{"$expr", {{"$eq", Value::array({{{"$size", {{"$ifNull", Value::array({"$tags", Value::array()})}}}}, 2})}}}},
+    };
+    for (size_t i = 0; i < filters.size(); i++) {
+        out.emplace_back("find#" + std::to_string(i) + " " + filters[i].toJson(),
+                         canon(D.find(filters[i]).sort("_id").lean()));
+        out.emplace_back("count#" + std::to_string(i), std::to_string(D.countDocuments(filters[i])));
+    }
+    // formulas
+    for (const char *f : {"age >= 18 && age < 40", "score > age * 2", "city in ['Kolkata', 'Delhi'] || !active",
+                          "name == 'Bo' or tags in ['js']", "nested.x == 3 && exists(items)"}) {
+        out.emplace_back(std::string("formula ") + f, canon(D.find(f).sort("_id").lean()));
+    }
+    // sorting with missing / null / arrays, skip, limit, projection
+    out.emplace_back("sort age", canon(D.find().sort("age -_id").select("age").lean()));
+    out.emplace_back("sort -score", canon(D.find().sort("-score _id").limit(25).select("score").lean()));
+    out.emplace_back("sort tags", canon(D.find().sort("tags _id").select("tags").lean()));
+    out.emplace_back("sort -tags", canon(D.find().sort("-tags _id").select("tags").lean()));
+    out.emplace_back("sort name skip", canon(D.find().sort("name _id").skip(30).limit(40).select("name").lean()));
+    out.emplace_back("projection nested",
+                     canon(D.find({{"_id", {{"$lt", 20}}}}).sort("_id").select("nested.y items.qty").lean()));
+    out.emplace_back("projection exclude",
+                     canon(D.find({{"_id", {{"$lt", 20}}}}).sort("_id").select("-items -nested -at").lean()));
+    std::vector<Value> dc = D.distinct("city"), dt = D.distinct("tags"), da = D.distinct("age", {{"city", "Pune"}});
+    auto sorted = [](std::vector<Value> v) {
+        std::sort(v.begin(), v.end(), [](const Value &a, const Value &b) { return canon(a) < canon(b); });
+        return canon(v);
+    };
+    out.emplace_back("distinct city", sorted(dc));
+    out.emplace_back("distinct tags", sorted(dt));
+    out.emplace_back("distinct age", sorted(da));
+
+    // ---- random filters
+    const char *fields[] = {"age", "score", "name", "city", "tags", "active", "nested.x", "items.qty"};
+    for (int i = 0; i < 150; i++) {
+        std::string f = fields[pick(8)];
+        Value v;
+        if (f == "age" || f == "nested.x" || f == "items.qty")
+            v = pick(60);
+        else if (f == "score")
+            v = pick(1000) / 10.0;
+        else if (f == "name")
+            v = names[pick(10)];
+        else if (f == "city")
+            v = cities[pick(4)];
+        else if (f == "tags")
+            v = tagset[pick(5)];
+        else
+            v = pick(2) == 1;
+        const char *ops[] = {"$eq", "$ne", "$gt", "$gte", "$lt", "$lte", "$in", "$nin", "$exists"};
+        std::string op = ops[pick(9)];
+        Value cond = Value::object();
+        if (op == "$in" || op == "$nin")
+            cond[op] = Value::array({v, pick(2) ? Value() : v});
+        else if (op == "$exists")
+            cond[op] = pick(2) == 1;
+        else
+            cond[op] = v;
+        Value filter = Value::object();
+        filter[f] = cond;
+        if (pick(3) == 0) filter["active"] = pick(2) == 1;
+        std::vector<Value> ids;
+        for (auto &r : D.find(filter).sort("_id").select("_id").lean()) ids.push_back(r["_id"]);
+        out.emplace_back("random#" + std::to_string(i) + " " + filter.toJson(), canon(ids));
+    }
+
+    // ---- aggregation
+    std::vector<std::pair<std::string, Value>> pipes = {
+        {"group city", Value::array({{{"$group",
+                                       {{"_id", "$city"},
+                                        {"n", {{"$sum", 1}}},
+                                        {"avgAge", {{"$avg", "$age"}}},
+                                        {"minS", {{"$min", "$score"}}},
+                                        {"maxS", {{"$max", "$score"}}},
+                                        {"sumS", {{"$sum", "$score"}}}}}},
+                                     {{"$sort", {{"_id", 1}}}}})},
+        {"group first/last/push", Value::array({{{"$match", {{"city", "Pune"}}}},
+                                                {{"$sort", {{"_id", 1}}}},
+                                                {{"$group",
+                                                  {{"_id", "$active"},
+                                                   {"f", {{"$first", "$name"}}},
+                                                   {"l", {{"$last", "$age"}}},
+                                                   {"p", {{"$push", "$_id"}}},
+                                                   {"s", {{"$addToSet", "$city"}}}}}},
+                                                {{"$sort", {{"_id", 1}}}}})},
+        {"unwind tags", Value::array({{{"$unwind", "$tags"}},
+                                      {{"$group", {{"_id", "$tags"}, {"n", {{"$sum", 1}}}}}},
+                                      {{"$sort", {{"_id", 1}}}}})},
+        {"unwind keep", Value::array({{{"$match", {{"_id", {{"$lt", 15}}}}}},
+                                      {{"$unwind", {{"path", "$tags"}, {"preserveNullAndEmptyArrays", true}}}},
+                                      {{"$project", {{"tags", 1}}}},
+                                      {{"$sort", {{"_id", 1}, {"tags", 1}}}}})},
+        {"lookup city",
+         Value::array(
+             {{{"$match", {{"_id", {{"$lt", 30}}}}}},
+              {{"$lookup", {{"from", "diff_cities"}, {"localField", "city"}, {"foreignField", "_id"}, {"as", "c"}}}},
+              {{"$project", {{"c.state", 1}, {"city", 1}}}},
+              {{"$sort", {{"_id", 1}}}}})},
+        {"expressions", Value::array({{{"$match", {{"_id", {{"$lt", 40}}}}}},
+                                      {{"$project",
+                                        {{"total", expr("score * 2 + age")},
+                                         {"label", expr("if(age >= 40, 'old', 'young')")},
+                                         {"tagCount", expr("size(ifNull(tags, []))")},
+                                         {"nm", expr("concat(lower(ifNull(name, '-')), '!')")},
+                                         {"r", expr("round(score / 3, 1)")},
+                                         {"m", expr("age % 7")},
+                                         {"inPune", expr("city in ['Pune']")},
+                                         {"yr", expr("year(at)")},
+                                         {"hr", expr("hour(at, 'Asia/Kolkata')")}}}},
+                                      {{"$sort", {{"_id", 1}}}}})},
+        {"map/filter",
+         Value::array({{{"$match", {{"items", {{"$exists", true}}}}}},
+                       {{"$limit", 30}},
+                       {{"$addFields",
+                         {{"big",
+                           {{"$filter",
+                             {{"input", "$items"}, {"as", "i"}, {"cond", {{"$gte", Value::array({"$$i.qty", 3})}}}}}}},
+                          {"skus", {{"$map", {{"input", "$items"}, {"as", "i"}, {"in", "$$i.sku"}}}}},
+                          {"firstQty", {{"$arrayElemAt", Value::array({"$items.qty", 0})}}}}}},
+                       {{"$project", {{"big", 1}, {"skus", 1}, {"firstQty", 1}}}},
+                       {{"$sort", {{"_id", 1}}}}})},
+        {"count", Value::array({{{"$match", {{"active", true}}}}, {{"$count", "n"}}})},
+        {"facet",
+         Value::array({{{"$facet",
+                         {{"young", Value::array({{{"$match", {{"age", {{"$lt", 20}}}}}}, {{"$count", "n"}}})},
+                          {"names", Value::array({{{"$group", {{"_id", "$name"}}}}, {{"$sort", {{"_id", 1}}}}})}}}}})},
+        {"replaceRoot", Value::array({{{"$match", {{"nested", {{"$exists", true}}}}}},
+                                      {{"$replaceRoot", {{"newRoot", "$nested"}}}},
+                                      {{"$group", {{"_id", "$y"}, {"x", {{"$sum", "$x"}}}}}},
+                                      {{"$sort", {{"_id", 1}}}}})},
+        {"skip/limit", Value::array({{{"$sort", {{"score", -1}, {"_id", 1}}}},
+                                     {{"$skip", 10}},
+                                     {{"$limit", 10}},
+                                     {{"$project", {{"score", 1}}}}})},
+        {"group multi-key",
+         Value::array({{{"$group", {{"_id", {{"c", "$city"}, {"a", "$active"}}}, {"n", {{"$sum", 1}}}}}},
+                       {{"$sort", {{"_id.c", 1}, {"_id.a", 1}}}}})},
+        {"dateTrunc", Value::array({{{"$group",
+                                      {{"_id", {{"$dateTrunc", {{"date", "$at"}, {"unit", "day"}, {"binSize", 3}}}}},
+                                       {"n", {{"$sum", 1}}}}}},
+                                    {{"$sort", {{"_id", 1}}}}})},
+        {"dateTrunc week",
+         Value::array(
+             {{{"$group", {{"_id", {{"$dateTrunc", {{"date", "$at"}, {"unit", "week"}}}}}, {"n", {{"$sum", 1}}}}}},
+              {{"$sort", {{"_id", 1}}}}})},
+        {"dateTrunc tz",
+         Value::array(
+             {{{"$group",
+                {{"_id",
+                  {{"$dateTrunc", {{"date", "$at"}, {"unit", "hour"}, {"binSize", 7}, {"timezone", "Asia/Kolkata"}}}}},
+                 {"n", {{"$sum", 1}}}}}},
+              {{"$sort", {{"_id", 1}}}},
+              {{"$limit", 20}}})},
+    };
+    for (auto &[label, p] : pipes) out.emplace_back("agg " + label, canon(D.aggregate(p)));
+    out.emplace_back(
+        "builder bucket",
+        canon(D.aggregate().bucketByTime("at", "6h", {count(), avg("score")}, {.timezone = "Asia/Kolkata"}).exec()));
+    out.emplace_back("builder bucket fill",
+                     canon(D.aggregate()
+                               .match("_id < 40")
+                               .bucketByTime("at", "1d", {count()}, {.by = "city", .fillGaps = true})
+                               .exec()));
+    out.emplace_back("countBy", canon(D.countBy("city")));
+    out.emplace_back("stats", canon(D.stats("score")));
+    out.emplace_back("latestPerGroup", canon(D.latestPerGroup("city", "at")));
+
+    // ---- updates (each step changes the data; the whole collection is compared after every step)
+    auto step = [&](const std::string &label, const std::function<std::string()> &fn) {
+        std::string r;
+        try {
+            r = fn();
+        } catch (const Error &e) {
+            r = std::string("error:") + (dynamic_cast<const DuplicateKeyError *>(&e) ? "dup" : "other");
+        }
+        out.emplace_back("upd " + label, r);
+        out.emplace_back("after " + label, all());
+    };
+    auto res = [](const UpdateResult &u) {
+        return std::to_string(u.matchedCount) + "/" + std::to_string(u.modifiedCount) + "/" + u.upsertedId.toJson();
+    };
+    step("set", [&] { return res(D.updateMany({{"city", "Pune"}}, {{"nested.y", "pune"}})); });
+    step("inc", [&] { return res(D.updateMany({{"age", {{"$lt", 20}}}}, {{"$inc", {{"age", 5}, {"score", 1.5}}}})); });
+    step("mul", [&] { return res(D.updateMany({{"active", false}}, {{"$mul", {{"score", 2}}}})); });
+    step("unset", [&] { return res(D.updateMany({{"tags", "x"}}, {{"$unset", {{"city", ""}}}})); });
+    step("min/max", [&] {
+        return res(D.updateMany({{"_id", {{"$lt", 50}}}}, {{"$min", {{"score", 20}}}, {"$max", {{"age", 30}}}}));
+    });
+    step("push each", [&] {
+        return res(D.updateMany({{"_id", {{"$mod", Value::array({10, 1})}}}},
+                                {{"$push", {{"tags", {{"$each", Value::array({"new", "cpp"})}}}}}}));
+    });
+    step("addToSet", [&] { return res(D.updateMany({{"_id", {{"$lt", 30}}}}, {{"$addToSet", {{"tags", "cpp"}}}})); });
+    step("pull value", [&] { return res(D.updateMany(Value::object(), {{"$pull", {{"tags", "js"}}}})); });
+    step("pull cond", [&] {
+        return res(D.updateMany({{"items", {{"$exists", true}}}}, {{"$pull", {{"items", {{"qty", {{"$lt", 2}}}}}}}}));
+    });
+    step("positional $", [&] { return res(D.updateMany({{"items.sku", "s3"}}, {{"$set", {{"items.$.qty", 99}}}})); });
+    step("all positional", [&] {
+        return res(
+            D.updateMany({{"_id", {{"$lt", 60}}}, {"items", {{"$exists", true}}}}, {{"$inc", {{"items.$[].qty", 1}}}}));
+    });
+    step("upsert", [&] { return res(D.updateOne({{"_id", 1000}, {"city", "Goa"}}, {{"age", 1}}, {.upsert = true})); });
+    step("upsert none", [&] { return res(D.updateOne({{"_id", 1000}}, {{"age", 2}}, {.upsert = true})); });
+    step("replace", [&] { return res(D.replaceOne({{"_id", 5}}, {{"name", "replaced"}, {"age", 50}})); });
+    step("dup code", [&] { return res(D.updateOne({{"_id", 1}}, {{"code", "c7"}})); });
+    step("findOneAndUpdate", [&] {
+        auto d = D.findOneAndUpdate({{"_id", 2}}, {{"$inc", {{"age", 1}}}}, {.returnNew = true});
+        return d ? canon(d->toObject()) : "none";
+    });
+    step("findOneAndDelete", [&] {
+        auto d = D.findOneAndDelete({{"_id", 3}});
+        return d ? canon(d->toObject()) : "none";
+    });
+    step("deleteMany", [&] { return std::to_string(D.deleteMany({{"age", {{"$gte", 70}}}})); });
+    step("bulk", [&] {
+        auto b = D.bulkWrite({{{"insertOne", {{"document", {{"_id", 2000}, {"name", "bulk"}}}}}},
+                              {{"updateMany", {{"filter", {{"name", "bulk"}}}, {"update", {{"age", 9}}}}}},
+                              {{"deleteOne", {{"filter", {{"_id", 4}}}}}}});
+        return std::to_string(b.insertedCount) + "/" + std::to_string(b.matchedCount) + "/" +
+               std::to_string(b.deletedCount);
+    });
+    step("transaction rollback", [&] {
+        try {
+            transaction([&] {
+                D.updateMany(Value::object(), {{"age", 0}});
+                throw Error("stop");
+            });
+        } catch (const Error &) {
+        }
+        return std::string("rolled back");
+    });
+    D.dropCollection();
+    C.dropCollection();
+    return out;
+}
+
+static void testMemoryVsMongo() {
+    section("in-memory database == real MongoDB (differential test, 3 random data sets)");
+    const char *env = std::getenv("NEVLA_TEST_URI");
+    std::string uri = env ? env : "mongodb://127.0.0.1:27017/?directConnection=true";
+    size_t total = 0;
+    int mismatches = 0;
+    for (unsigned seed : {20261118u, 7u, 424242u}) {
+        Outputs mongo = diffScenario(seed);
+        connect("memory://nevla_diff");
+        Outputs memory = diffScenario(seed);
+        connect(uri, "nevla_test");
+        CHECK(mongo.size() == memory.size());
+        for (size_t i = 0; i < std::min(mongo.size(), memory.size()); i++) {
+            bool same = mongo[i].first == memory[i].first && mongo[i].second == memory[i].second;
+            CHECK(same);
+            if (!same && ++mismatches <= 8)
+                std::cout << "  differs (seed " << seed << "): " << mongo[i].first
+                          << "\n    mongo : " << mongo[i].second.substr(0, 400)
+                          << "\n    memory: " << memory[i].second.substr(0, 400) << "\n";
+        }
+        total += mongo.size();
+    }
+    std::cout << "  compared " << total << " results\n";
+}
+
+// Runs a test function and turns an escaped exception into a failure (the remaining tests still run)
+template <class F>
+static void run(const char *name, F fn) {
+    try {
+        fn();
+    } catch (const std::exception &e) {
+        ++failed;
+        std::cout << "  FAIL " << name << " threw: " << e.what() << "\n";
+    }
+}
+
 int main() {
-    testValue();
-    testSchemaOffline();
-    testSchemaFeaturesOffline();
-    testAggregateBuilderOffline();
-    testFormulasOffline();
+    run("testValue", testValue);
+    run("testSchemaOffline", testSchemaOffline);
+    run("testSchemaFeaturesOffline", testSchemaFeaturesOffline);
+    run("testAggregateBuilderOffline", testAggregateBuilderOffline);
+    run("testFormulasOffline", testFormulasOffline);
 
     const char *env = std::getenv("NEVLA_TEST_URI");
     std::string uri = env ? env : "mongodb://127.0.0.1:27017/?directConnection=true";
+    gMemory = uri.rfind("memory://", 0) == 0;
     CHECK_THROWS(model("OfflineThing").countDocuments(), Error);  // before connect()
     try {
         connect(uri, "nevla_test");
@@ -2232,31 +2826,35 @@ int main() {
         return 2;
     }
     CHECK(connected());
-    testCrud();
-    testHooksVirtualsMethods();
-    testPopulate();
-    testDiscriminators();
-    testCustomIdIndexesMixed();
-    testTransactions();
-    testThreads();
-    testUpdateCasting();
-    testQueryFeatures();
-    testPopulateFeatures();
-    testStaticsHooksDocs();
-    testModelExtras();
-    testAggregateBuilderDb();
-    testV04Db();
-    testSlowAndStrict();
-    testTypedModels();
-    testAsync();
-    testTimeSeries();
-    testBatchWriter();
-    testFromQuery();
-    testSchemaExport();
-    testSoftDelete();
-    testHistory();
-    testMultiTenant();
-    testEncryption();
+    if (gMemory) std::cout << "(in-memory database: server-only checks are skipped)\n";
+    run("testCrud", testCrud);
+    run("testHooksVirtualsMethods", testHooksVirtualsMethods);
+    run("testPopulate", testPopulate);
+    run("testDiscriminators", testDiscriminators);
+    run("testCustomIdIndexesMixed", testCustomIdIndexesMixed);
+    run("testTransactions", testTransactions);
+    run("testThreads", testThreads);
+    run("testUpdateCasting", testUpdateCasting);
+    run("testQueryFeatures", testQueryFeatures);
+    run("testPopulateFeatures", testPopulateFeatures);
+    run("testStaticsHooksDocs", testStaticsHooksDocs);
+    run("testModelExtras", testModelExtras);
+    run("testAggregateBuilderDb", testAggregateBuilderDb);
+    run("testV04Db", testV04Db);
+    if (!gMemory) run("testSlowAndStrict", testSlowAndStrict);  // uses $where / $function to be slow
+    run("testTypedModels", testTypedModels);
+    run("testAsync", testAsync);
+    run("testTimeSeries", testTimeSeries);
+    run("testBatchWriter", testBatchWriter);
+    run("testFromQuery", testFromQuery);
+    run("testSchemaExport", testSchemaExport);
+    run("testSoftDelete", testSoftDelete);
+    run("testHistory", testHistory);
+    run("testMultiTenant", testMultiTenant);
+    run("testEncryption", testEncryption);
+    run("testMigrations", testMigrations);
+    run("testCache", testCache);
+    if (!gMemory) run("testMemoryVsMongo", testMemoryVsMongo);
     disconnect();
     CHECK(!connected());
 

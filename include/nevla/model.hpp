@@ -8,6 +8,7 @@
 
 #include <chrono>
 #include <future>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
@@ -155,6 +156,7 @@ class Document {
   private:
     friend class Model;
     friend struct ModelImpl;
+    friend class BatchWriter;
     std::shared_ptr<ModelImpl> m_;
     Value data_ = Value::object();
     std::set<std::string> modified_;
@@ -313,6 +315,59 @@ struct Page {
     std::vector<Document> docs;
     int64_t total = 0, page = 1, perPage = 0, pages = 0;
     bool hasNext = false, hasPrev = false;
+    Value toJSON() const;  // {docs: [...toJSON()], total, page, perPage, pages, hasNext, hasPrev}: ready for an API
+};
+
+/* ---------------- REST query parameters -> query ----------------
+   GET /users?age[gte]=18&role=admin&city[in]=Kolkata,Durgapur&sort=-createdAt&page=2&limit=20&fields=name,email
+     auto page = User.fromQuery(params, {.allow = {"age", "role", "city", "createdAt"}});
+     return page.toJSON();
+   Operators: field=v  field[eq|ne|gt|gte|lt|lte]=v  field[in|nin]=a,b  field[exists]=true|false
+              field[contains]=text  field[startsWith]=text  (case-insensitive, special characters escaped)
+              field[regex]=... only with allowRegex
+   Values are cast with the schema ("18" -> 18, "2026-11-01" -> Date). Anything not allowed -> QueryParamError. */
+class QueryParamError : public Error {
+  public:
+    std::string param;
+    QueryParamError(std::string p, const std::string &msg) : Error(msg), param(std::move(p)) {}
+};
+struct QueryParamOptions {
+    std::vector<std::string> allow;       // fields that may be filtered (and sorted, selected unless listed below)
+    std::vector<std::string> sortable;    // empty = same as allow
+    std::vector<std::string> selectable;  // fields= ; empty = same as allow (+ _id)
+    int64_t defaultLimit = 20, maxLimit = 100;
+    std::string defaultSort;    // e.g. "-createdAt"
+    bool rejectUnknown = true;  // unknown parameters -> QueryParamError (false: ignored)
+    bool allowRegex = false;    // field[regex]= (a user-supplied regex can be very slow)
+};
+// "a=1&b=x%20y" -> {{"a","1"},{"b","x y"}}  (URL-decoded, '+' = space)
+std::map<std::string, std::string> parseQueryString(std::string_view query);
+
+/* ---------------- Batch writer ----------------
+   auto writer = Reading.batchWriter({.maxDocs = 500, .maxDelayMs = 200});
+   writer.add({{"device", id}, {"value", 30.5}});    // validated now, written in the background
+   writer.flush();                                    // wait until everything queued is written    */
+struct BatchOptions {
+    size_t maxDocs = 500;      // write when this many are queued ...
+    int64_t maxDelayMs = 200;  // ... or when the oldest has waited this long
+    size_t maxQueue = 100000;  // add() waits when the queue is this full (backpressure)
+    bool ordered = false;      // false: one bad document does not stop the rest of the batch
+};
+struct BatchStats {
+    int64_t queued = 0, written = 0, failed = 0, batches = 0;
+};
+struct BatchWriterImpl;
+class BatchWriter {
+  public:
+    void add(const Value &doc);  // throws ValidationError right away for a bad document
+    void flush();                // write everything that is queued and wait for it
+    BatchStats stats() const;
+    // A batch failed (e.g. duplicate key, server down): message + how many documents of it were lost
+    void onError(std::function<void(const std::string &message, int64_t failedDocs)> fn);
+
+  private:
+    friend class Model;
+    std::shared_ptr<BatchWriterImpl> impl_;  // copies share the writer; the last one flushes and stops it
 };
 
 class Query : public QueryBase<Query> {
@@ -581,7 +636,16 @@ class Model {
     }
 
     void createIndexes() const;  // create the schema's indexes now (throws on failure)
-    void syncIndexes() const;    // createIndexes() + drop indexes that are no longer in the schema
+    // Create the collection now (time-series options, validator); normally it is created on first use
+    void createCollection() const;
+    Value collectionInfo() const;  // listCollections entry: {name, type: "collection" | "timeseries", options}
+    // Store the schema as MongoDB's own $jsonSchema validator, so even other programs cannot write bad data.
+    // level: "strict" | "moderate" (existing invalid documents can still be updated); action: "error" | "warn"
+    void syncValidator(const std::string &level = "strict", const std::string &action = "error") const;
+
+    BatchWriter batchWriter(BatchOptions options = {}) const;
+    Page fromQuery(const std::map<std::string, std::string> &params, const QueryParamOptions &options) const;
+    void syncIndexes() const;  // createIndexes() + drop indexes that are no longer in the schema
     std::vector<Value> listIndexes() const;
     void dropCollection() const;
 
@@ -592,6 +656,7 @@ class Model {
 
   private:
     friend Model model(const std::string &, const Schema &, const std::string &);
+    friend class BatchWriter;
     friend Model model(const std::string &);
     explicit Model(std::shared_ptr<ModelImpl> m) : m_(std::move(m)) {}
     std::shared_ptr<ModelImpl> m_;

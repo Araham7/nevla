@@ -712,3 +712,214 @@ void applyGetters(const Schema &s, Value &obj) {
 
 }  // namespace detail
 }  // namespace nevla
+
+/* ======================= schema export ======================= */
+namespace nevla {
+namespace {
+
+enum class Flavor { Json, OpenApi };
+
+Value jsonSchemaOf(const Schema &s, bool topLevel, Flavor fl);
+
+Value fieldSchema(const Field &f, Flavor fl) {
+    Value out = Value::object();
+    bool json = fl == Flavor::Json;
+    switch (f.type) {
+        case FieldType::String:
+            if (json)
+                out["bsonType"] = "string";
+            else
+                out["type"] = "string";
+            if (f.minLength_) out["minLength"] = static_cast<int64_t>(*f.minLength_);
+            if (f.maxLength_) out["maxLength"] = static_cast<int64_t>(*f.maxLength_);
+            if (!f.match_.empty()) out["pattern"] = f.match_;
+            break;
+        case FieldType::Number:
+        case FieldType::Int:
+            if (json)
+                out["bsonType"] = f.type == FieldType::Int ? Value::array({"int", "long"})
+                                                           : Value::array({"double", "int", "long", "decimal"});
+            else
+                out["type"] = f.type == FieldType::Int ? "integer" : "number";
+            if (f.min_ && !f.minIsDate_) out["minimum"] = *f.min_;
+            if (f.max_ && !f.maxIsDate_) out["maximum"] = *f.max_;
+            break;
+        case FieldType::Boolean:
+            if (json)
+                out["bsonType"] = "bool";
+            else
+                out["type"] = "boolean";
+            break;
+        case FieldType::Date:
+            if (json)
+                out["bsonType"] = "date";
+            else {
+                out["type"] = "string";
+                out["format"] = "date-time";
+            }
+            break;
+        case FieldType::ObjectId:
+            if (json)
+                out["bsonType"] = "objectId";
+            else {
+                out["type"] = "string";
+                out["pattern"] = "^[0-9a-fA-F]{24}$";
+            }
+            break;
+        case FieldType::Array: {
+            if (json)
+                out["bsonType"] = "array";
+            else
+                out["type"] = "array";
+            if (f.schema_)
+                out["items"] = jsonSchemaOf(*f.schema_, false, fl);
+            else if (f.of_)
+                out["items"] = fieldSchema(*f.of_, fl);
+            if (f.minLength_) out["minItems"] = static_cast<int64_t>(*f.minLength_);
+            break;
+        }
+        case FieldType::Object:
+            out = f.schema_ ? jsonSchemaOf(*f.schema_, false, fl) : Value::object();
+            if (!f.schema_) {
+                if (json)
+                    out["bsonType"] = "object";
+                else
+                    out["type"] = "object";
+            }
+            break;
+        case FieldType::Map:
+            if (json)
+                out["bsonType"] = "object";
+            else
+                out["type"] = "object";
+            out["additionalProperties"] = f.of_ ? fieldSchema(*f.of_, fl) : Value(true);
+            break;
+        case FieldType::Mixed:
+            break;  // anything
+    }
+    if (!f.enum_.empty()) {
+        Value e = Value::array();
+        for (const auto &v : f.enum_) e.push_back(v);
+        if (json && !f.required_) e.push_back(Value());  // optional: may be null
+        out["enum"] = e;
+    }
+    // optional fields may hold null (MongoDB only; OpenAPI clients usually omit them instead)
+    if (json && !f.required_ && f.type != FieldType::Mixed && out.contains("bsonType")) {
+        Value t = out["bsonType"];
+        Value arr = t.isArray() ? t : Value::array({t});
+        arr.push_back("null");
+        out["bsonType"] = arr;
+    }
+    if (!json && f.type != FieldType::Mixed && !f.required_ && f.default_) out["default"] = *f.default_;
+    return out;
+}
+
+Value jsonSchemaOf(const Schema &s, bool topLevel, Flavor fl) {
+    bool json = fl == Flavor::Json;
+    Value out = Value::object();
+    if (json)
+        out["bsonType"] = "object";
+    else
+        out["type"] = "object";
+    Value props = Value::object(), required = Value::array();
+    if (topLevel) {
+        if (!s.hasOwnId()) {
+            Field id = Id();
+            id.required_ = true;
+            props["_id"] = fieldSchema(id, fl);
+            if (!json) props["_id"]["readOnly"] = true;
+        }
+        if (s.options.timestamps) {
+            for (const auto &n : {s.options.createdAt, s.options.updatedAt}) {
+                Field d = DateTime();
+                props[n] = fieldSchema(d, fl);
+                if (!json) props[n]["readOnly"] = true;
+            }
+        }
+        if (!s.options.versionKey.empty()) {
+            Field v = Int();
+            props[s.options.versionKey] = fieldSchema(v, fl);
+            if (!json) props[s.options.versionKey]["readOnly"] = true;
+        }
+    }
+    for (const auto &kv : s.fields()) {
+        props[kv.first] = fieldSchema(kv.second, fl);
+        if (kv.second.required_) required.push_back(kv.first);
+    }
+    if (topLevel && json && !s.hasOwnId()) required.push_back("_id");
+    out["properties"] = props;
+    if (!required.empty()) out["required"] = required;
+    return out;
+}
+
+std::string tsType(const Field &f, int indent);
+
+std::string tsObject(const Schema &s, int indent, bool topLevel) {
+    std::string pad(indent + 2, ' '), out = "{\n";
+    auto line = [&](const std::string &name, const std::string &type, bool optional) {
+        bool plain =
+            !name.empty() && (std::isalpha(static_cast<unsigned char>(name[0])) || name[0] == '_' || name[0] == '$');
+        for (char c : name) plain &= std::isalnum(static_cast<unsigned char>(c)) || c == '_' || c == '$';
+        out += pad + (plain ? name : Value(name).toJson()) + (optional ? "?: " : ": ") + type + ";\n";
+    };
+    if (topLevel) {
+        if (!s.hasOwnId()) line("_id", "string", false);
+        if (s.options.virtuals) line("id", "string", true);
+    }
+    for (const auto &kv : s.fields()) {
+        const Field &f = kv.second;
+        bool always = f.required_ || f.default_ || f.defaultFn_;
+        line(kv.first, tsType(f, indent + 2), !always);
+    }
+    if (topLevel) {
+        if (s.options.timestamps) {
+            line(s.options.createdAt, "string", false);
+            line(s.options.updatedAt, "string", false);
+        }
+        if (!s.options.versionKey.empty()) line(s.options.versionKey, "number", true);
+    }
+    return out + std::string(indent, ' ') + "}";
+}
+
+std::string tsType(const Field &f, int indent) {
+    if (!f.enum_.empty()) {
+        std::string out;
+        for (const auto &v : f.enum_) out += (out.empty() ? "" : " | ") + v.toJson();
+        return out;
+    }
+    switch (f.type) {
+        case FieldType::String:
+        case FieldType::Date:  // JSON carries dates as ISO strings
+        case FieldType::ObjectId:
+            return "string";
+        case FieldType::Number:
+        case FieldType::Int:
+            return "number";
+        case FieldType::Boolean:
+            return "boolean";
+        case FieldType::Mixed:
+            return "unknown";
+        case FieldType::Array: {
+            std::string inner = f.schema_ ? tsObject(*f.schema_, indent, false)
+                                : f.of_   ? tsType(*f.of_, indent)
+                                          : "unknown";
+            bool simple = inner.find_first_of(" |") == std::string::npos;
+            return simple ? inner + "[]" : "Array<" + inner + ">";
+        }
+        case FieldType::Object:
+            return f.schema_ ? tsObject(*f.schema_, indent, false) : "Record<string, unknown>";
+        case FieldType::Map:
+            return "Record<string, " + (f.of_ ? tsType(*f.of_, indent) : std::string("unknown")) + ">";
+    }
+    return "unknown";
+}
+}  // namespace
+
+Value Schema::toJsonSchema() const { return jsonSchemaOf(*this, true, Flavor::Json); }
+Value Schema::toOpenAPI() const { return jsonSchemaOf(*this, true, Flavor::OpenApi); }
+
+std::string Schema::toTypeScript(const std::string &interfaceName) const {
+    return "export interface " + interfaceName + " " + tsObject(*this, 0, true) + "\n";
+}
+
+}  // namespace nevla

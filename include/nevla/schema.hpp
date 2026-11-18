@@ -219,6 +219,14 @@ class Schema {
     // Change the result of toJSON() (e.g. remove password)
     Schema &toJSON(std::function<void(const Document &, Value &)> transform);
 
+    /* Export the schema
+         toJsonSchema()      MongoDB $jsonSchema (server-side validation, see Model::syncValidator)
+         toTypeScript("User")  "export interface User { ... }" for a TypeScript / React frontend
+         toOpenAPI()         OpenAPI 3 schema object for API docs                                 */
+    Value toJsonSchema() const;
+    std::string toTypeScript(const std::string &interfaceName) const;
+    Value toOpenAPI() const;
+
     const Field *field(const std::string &name) const;  // top-level (+ _id and timestamps)
     // Dotted path: "address.city", "items.0.qty", "items.$.qty", "items.$[i].qty", "prices.inr" (Map)
     const Field *path(std::string_view dotted, bool *underMixed = nullptr) const;

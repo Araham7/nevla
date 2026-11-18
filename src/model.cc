@@ -6,12 +6,15 @@
 #include <bsoncxx/builder/basic/kvp.hpp>
 #include <bsoncxx/exception/exception.hpp>
 #include <cmath>
+#include <condition_variable>
+#include <deque>
 #include <iostream>
 #include <map>
 #include <mongocxx/bulk_write.hpp>
 #include <mongocxx/change_stream.hpp>
 #include <mongocxx/client.hpp>
 #include <mongocxx/client_session.hpp>
+#include <mongocxx/exception/bulk_write_exception.hpp>
 #include <mongocxx/exception/exception.hpp>
 #include <mongocxx/exception/operation_exception.hpp>
 #include <mongocxx/hint.hpp>
@@ -33,6 +36,7 @@
 #include <mongocxx/uri.hpp>
 #include <mutex>
 #include <sstream>
+#include <thread>
 
 #include "bson.hpp"
 
@@ -288,10 +292,32 @@ void createIndexesNow(ModelImpl &m, Conn &c) {
     });
 }
 
+// Explicit collection creation: time-series collections must exist before the first insert
+void createCollectionNow(ModelImpl &m, Conn &c) {
+    const TimeSeriesOptions &ts = m.schema.options.timeseries;
+    if (ts.timeField.empty() || !m.discKey.empty()) return;
+    Value cmd = Value::object();
+    cmd["create"] = m.collection;
+    Value t{{"timeField", ts.timeField}};
+    if (!ts.metaField.empty()) t["metaField"] = ts.metaField;
+    if (!ts.granularity.empty()) t["granularity"] = ts.granularity;
+    cmd["timeseries"] = t;
+    if (ts.expireAfterSeconds > 0) cmd["expireAfterSeconds"] = ts.expireAfterSeconds;
+    try {
+        auto entry = c.pool->acquire();
+        OpTrace nv_trace(m.collection, "createCollection", cmd);
+        (*entry)[c.db].run_command(toBson(cmd));
+    } catch (const mongocxx::operation_exception &e) {
+        if (e.code().value() == 48) return;  // NamespaceExists: already there
+        throw Error("nevla: could not create time-series collection \"" + m.collection + "\": " + e.what());
+    }
+}
+
 void ensureIndexes(ModelImpl &m, Conn &c) {
     if (m.indexGen.load() == c.gen) return;
     std::lock_guard<std::mutex> lk(m.indexMu);
     if (m.indexGen.load() == c.gen) return;
+    createCollectionNow(m, c);  // throws: the operation fails with a clear message
     if (m.schema.options.autoIndex) {
         // A failing index (e.g. duplicates already stored) must not block every operation of the model
         try {
@@ -2674,8 +2700,367 @@ Model Model::discriminator(const std::string &name, const Schema &extra) const {
     return Model(child);
 }
 
+/* ======================= collections, validator ======================= */
+void Model::createCollection() const {
+    auto c = currentConn();
+    createCollectionNow(*m_, *c);
+    if (m_->schema.options.timeseries.timeField.empty()) {
+        try {
+            auto entry = c->pool->acquire();
+            (*entry)[c->db].run_command(make_document(kvp("create", m_->collection)));
+        } catch (const mongocxx::operation_exception &e) {
+            if (e.code().value() != 48) throw Error(std::string("MongoDB: ") + e.what());
+        }
+    }
+}
+
+Value Model::collectionInfo() const {
+    auto c = currentConn();
+    return guard([&]() -> Value {
+        auto entry = c->pool->acquire();
+        Value cmd{{"listCollections", 1}, {"filter", Value{{"name", m_->collection}}}};
+        Value res = fromBson((*entry)[c->db].run_command(toBson(cmd)).view());
+        const Value &batch = res["cursor"]["firstBatch"];
+        return batch.size() ? batch.at(0) : Value();
+    });
+}
+
+void Model::syncValidator(const std::string &level, const std::string &action) const {
+    if (level != "strict" && level != "moderate" && level != "off")
+        throw Error("nevla: syncValidator(): level must be \"strict\", \"moderate\" or \"off\"");
+    if (action != "error" && action != "warn")
+        throw Error("nevla: syncValidator(): action must be \"error\" or \"warn\"");
+    createCollection();
+    auto c = currentConn();
+    Value cmd = Value::object();
+    cmd["collMod"] = m_->collection;
+    cmd["validator"] = Value{{"$jsonSchema", m_->schema.toJsonSchema()}};
+    cmd["validationLevel"] = level;
+    cmd["validationAction"] = action;
+    guard([&] {
+        auto entry = c->pool->acquire();
+        OpTrace nv_trace(m_->collection, "collMod", cmd);
+        (*entry)[c->db].run_command(toBson(cmd));
+    });
+}
+
+/* ======================= Page / fromQuery ======================= */
+Value Page::toJSON() const {
+    Value list = Value::array();
+    for (const auto &d : docs) list.push_back(d.toJSON());
+    return Value{{"docs", list},   {"total", total},     {"page", page},      {"perPage", perPage},
+                 {"pages", pages}, {"hasNext", hasNext}, {"hasPrev", hasPrev}};
+}
+
+std::map<std::string, std::string> parseQueryString(std::string_view q) {
+    auto decode = [](std::string_view in) {
+        std::string out;
+        for (size_t i = 0; i < in.size(); i++) {
+            if (in[i] == '+') {
+                out += ' ';
+            } else if (in[i] == '%' && i + 2 < in.size() + 0 && std::isxdigit(static_cast<unsigned char>(in[i + 1])) &&
+                       std::isxdigit(static_cast<unsigned char>(in[i + 2]))) {
+                out += static_cast<char>(std::stoi(std::string(in.substr(i + 1, 2)), nullptr, 16));
+                i += 2;
+            } else {
+                out += in[i];
+            }
+        }
+        return out;
+    };
+    std::map<std::string, std::string> out;
+    if (!q.empty() && q[0] == '?') q.remove_prefix(1);
+    while (!q.empty()) {
+        size_t amp = q.find('&');
+        std::string_view part = q.substr(0, amp);
+        if (!part.empty()) {
+            size_t eq = part.find('=');
+            out[decode(part.substr(0, eq))] = eq == std::string_view::npos ? "" : decode(part.substr(eq + 1));
+        }
+        if (amp == std::string_view::npos) break;
+        q.remove_prefix(amp + 1);
+    }
+    return out;
+}
+
+namespace {
+std::vector<std::string> splitList(const std::string &s) {
+    std::vector<std::string> out;
+    std::string cur;
+    for (char c : s) {
+        if (c == ',' || c == ' ') {
+            if (!cur.empty()) out.push_back(cur);
+            cur.clear();
+        } else {
+            cur += c;
+        }
+    }
+    if (!cur.empty()) out.push_back(cur);
+    return out;
+}
+
+std::string escapeRegex(const std::string &s) {
+    std::string out;
+    for (char c : s) {
+        if (std::string("\\^$.|?*+()[]{}/").find(c) != std::string::npos) out += '\\';
+        out += c;
+    }
+    return out;
+}
+
+int64_t parseCount(const std::string &param, const std::string &v) {
+    if (v.empty() || v.size() > 9 || !std::all_of(v.begin(), v.end(), [](unsigned char c) { return std::isdigit(c); }))
+        throw QueryParamError(param,
+                              "nevla: query parameter \"" + param + "\" must be a whole number, got \"" + v + "\"");
+    return std::stoll(v);
+}
+}  // namespace
+
+Page Model::fromQuery(const std::map<std::string, std::string> &params, const QueryParamOptions &o) const {
+    auto inList = [](const std::vector<std::string> &l, const std::string &x) {
+        return std::find(l.begin(), l.end(), x) != l.end();
+    };
+    const auto &sortable = o.sortable.empty() ? o.allow : o.sortable;
+    const auto &selectable = o.selectable.empty() ? o.allow : o.selectable;
+    Value filter = Value::object();
+    int64_t page = 1, limit = o.defaultLimit;
+    std::string sort = o.defaultSort, select;
+
+    for (const auto &[key, value] : params) {
+        if (key == "page") {
+            page = parseCount(key, value);
+            if (page < 1) throw QueryParamError(key, "nevla: page must be 1 or more");
+            continue;
+        }
+        if (key == "limit" || key == "perPage") {
+            limit = parseCount(key, value);
+            if (limit < 1) throw QueryParamError(key, "nevla: limit must be 1 or more");
+            limit = std::min(limit, o.maxLimit);
+            continue;
+        }
+        if (key == "sort") {
+            sort.clear();
+            for (auto &tok : splitList(value)) {
+                std::string f = tok[0] == '-' || tok[0] == '+' ? tok.substr(1) : tok;
+                if (!inList(sortable, f)) throw QueryParamError(key, "nevla: sorting by \"" + f + "\" is not allowed");
+                sort += (tok[0] == '-' ? "-" : "") + f + " ";
+            }
+            continue;
+        }
+        if (key == "fields") {
+            for (auto &f : splitList(value)) {
+                if (f != "_id" && !inList(selectable, f))
+                    throw QueryParamError(key, "nevla: selecting \"" + f + "\" is not allowed");
+                select += f + " ";
+            }
+            continue;
+        }
+        // field or field[op]
+        std::string field = key, op = "eq";
+        if (auto b = key.find('['); b != std::string::npos) {
+            if (key.back() != ']')
+                throw QueryParamError(key, "nevla: bad parameter \"" + key + "\" (expected field[op])");
+            field = key.substr(0, b);
+            op = key.substr(b + 1, key.size() - b - 2);
+        }
+        if (!inList(o.allow, field) || field.find('$') != std::string::npos) {
+            if (o.rejectUnknown) throw QueryParamError(key, "nevla: filtering by \"" + field + "\" is not allowed");
+            continue;
+        }
+        Value &cond = filter[field];
+        if (!cond.isObject()) cond = Value::object();
+        static const std::map<std::string, std::string> simple = {{"eq", "$eq"},   {"ne", "$ne"}, {"gt", "$gt"},
+                                                                  {"gte", "$gte"}, {"lt", "$lt"}, {"lte", "$lte"}};
+        if (auto it = simple.find(op); it != simple.end()) {
+            cond[it->second] = value;
+        } else if (op == "in" || op == "nin") {
+            Value arr = Value::array();
+            for (auto &v : splitList(value)) arr.push_back(v);
+            cond[op == "in" ? "$in" : "$nin"] = arr;
+        } else if (op == "exists") {
+            if (value != "true" && value != "false")
+                throw QueryParamError(key, "nevla: \"" + key + "\" must be true or false");
+            cond["$exists"] = value == "true";
+        } else if (op == "contains" || op == "startsWith") {
+            cond["$regex"] = (op == "startsWith" ? "^" : "") + escapeRegex(value);
+            cond["$options"] = "i";
+        } else if (op == "regex" && o.allowRegex) {
+            try {
+                std::regex check(value);
+            } catch (const std::regex_error &) {
+                throw QueryParamError(key, "nevla: \"" + key + "\" is not a valid regular expression");
+            }
+            cond["$regex"] = value;
+        } else {
+            throw QueryParamError(key, "nevla: unknown operator [" + op + "] in \"" + key + "\"");
+        }
+    }
+    try {
+        Query q = find(filter);
+        if (!sort.empty()) q.sort(sort);
+        if (!select.empty()) q.select(select);
+        return q.paginate(page, limit);
+    } catch (const CastError &e) {
+        throw QueryParamError(e.path, std::string("nevla: bad value for \"") + e.path + "\": " + e.what());
+    }
+}
+
+/* ======================= BatchWriter ======================= */
+struct BatchWriterImpl {
+    std::shared_ptr<ModelImpl> m;
+    BatchOptions o;
+    std::mutex mu;
+    std::condition_variable cv, done;
+    std::deque<std::pair<Value, std::chrono::steady_clock::time_point>> queue;
+    size_t inFlight = 0;
+    uint64_t flushWanted = 0;
+    bool stop = false;
+    BatchStats stats;
+    std::function<void(const std::string &, int64_t)> onError;
+    std::thread worker;
+
+    BatchWriterImpl(std::shared_ptr<ModelImpl> model, BatchOptions opts) : m(std::move(model)), o(opts) {
+        if (o.maxDocs == 0) o.maxDocs = 1;
+        if (o.maxQueue < o.maxDocs) o.maxQueue = o.maxDocs;
+        worker = std::thread([this] { loop(); });
+    }
+    ~BatchWriterImpl() {
+        {
+            std::lock_guard<std::mutex> lk(mu);
+            stop = true;
+        }
+        cv.notify_all();
+        if (worker.joinable()) worker.join();  // the loop writes what is left before it ends
+    }
+
+    void loop() {
+        std::unique_lock<std::mutex> lk(mu);
+        for (;;) {
+            if (queue.empty()) {
+                done.notify_all();
+                if (stop) return;
+                cv.wait(lk, [&] { return stop || !queue.empty(); });
+                continue;
+            }
+            auto deadline = queue.front().second + std::chrono::milliseconds(o.maxDelayMs);
+            bool ready =
+                stop || flushWanted || queue.size() >= o.maxDocs || std::chrono::steady_clock::now() >= deadline;
+            if (!ready) {
+                cv.wait_until(lk, deadline, [&] { return stop || flushWanted || queue.size() >= o.maxDocs; });
+                continue;
+            }
+            std::vector<Value> batch;
+            while (!queue.empty() && batch.size() < o.maxDocs) {
+                batch.push_back(std::move(queue.front().first));
+                queue.pop_front();
+            }
+            inFlight = batch.size();
+            if (queue.empty()) flushWanted = 0;
+            lk.unlock();
+            cv.notify_all();  // add() may be waiting for room
+            int64_t written = 0;
+            std::string error;
+            write(batch, written, error);
+            std::function<void(const std::string &, int64_t)> errFn;
+            lk.lock();
+            inFlight = 0;
+            stats.batches++;
+            stats.written += written;
+            stats.failed += static_cast<int64_t>(batch.size()) - written;
+            if (!error.empty()) errFn = onError;
+            if (errFn) {
+                lk.unlock();
+                try {
+                    errFn(error, static_cast<int64_t>(batch.size()) - written);
+                } catch (...) {
+                }
+                lk.lock();
+            } else if (!error.empty()) {
+                std::cerr << "nevla: batch writer (" << m->collection << "): " << error << "\n";
+            }
+            done.notify_all();
+        }
+    }
+
+    void write(const std::vector<Value> &batch, int64_t &written, std::string &error) {
+        std::vector<bsoncxx::document::value> raw;
+        raw.reserve(batch.size());
+        for (const auto &v : batch) raw.push_back(toBson(v));
+        mongocxx::options::insert opts;
+        opts.ordered(o.ordered);
+        try {
+            Op op = open(*m);
+            OpTrace nv_trace(m->collection, "insertMany (batch)", Value{{"count", static_cast<int64_t>(raw.size())}});
+            auto r = NV(op, insert_many, raw, opts);
+            written = r ? r->inserted_count() : static_cast<int64_t>(raw.size());
+        } catch (const mongocxx::bulk_write_exception &e) {
+            written = 0;
+            if (auto raw = e.raw_server_error()) written = fromBson(raw->view())["nInserted"].asInt(0);
+            error = e.what();
+        } catch (const std::exception &e) {
+            written = 0;
+            error = e.what();
+        }
+    }
+};
+
+BatchWriter Model::batchWriter(BatchOptions options) const {
+    BatchWriter w;
+    w.impl_ = std::make_shared<BatchWriterImpl>(m_, options);
+    return w;
+}
+
+void BatchWriter::add(const Value &doc) {
+    if (!impl_) throw Error("nevla: this BatchWriter was not created with Model::batchWriter()");
+    Document d = Model(impl_->m)(doc);
+    d.validate();  // bad documents fail here, in the caller's thread
+    prepareInsert(*impl_->m, d.data_);
+    Value ready = std::move(d.data_);
+    std::unique_lock<std::mutex> lk(impl_->mu);
+    impl_->cv.wait(lk, [&] { return impl_->queue.size() < impl_->o.maxQueue || impl_->stop; });
+    impl_->queue.emplace_back(std::move(ready), std::chrono::steady_clock::now());
+    impl_->stats.queued++;
+    if (impl_->queue.size() >= impl_->o.maxDocs)
+        impl_->cv.notify_all();
+    else if (impl_->queue.size() == 1)
+        impl_->cv.notify_all();  // start the delay timer
+}
+
+void BatchWriter::flush() {
+    if (!impl_) return;
+    std::unique_lock<std::mutex> lk(impl_->mu);
+    impl_->flushWanted++;
+    impl_->cv.notify_all();
+    impl_->done.wait(lk, [&] { return impl_->queue.empty() && impl_->inFlight == 0; });
+}
+
+BatchStats BatchWriter::stats() const {
+    if (!impl_) return {};
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    return impl_->stats;
+}
+
+void BatchWriter::onError(std::function<void(const std::string &, int64_t)> fn) {
+    if (!impl_) return;
+    std::lock_guard<std::mutex> lk(impl_->mu);
+    impl_->onError = std::move(fn);
+}
+
 Model model(const std::string &name, const Schema &schema, const std::string &collection) {
     if (name.empty()) throw Error("nevla: model name cannot be empty");
+    const TimeSeriesOptions &ts = schema.options.timeseries;
+    if (!ts.timeField.empty()) {
+        const Field *tf = schema.field(ts.timeField);
+        if (!tf || tf->type != FieldType::Date)
+            throw Error("nevla: model \"" + name + "\": timeseries.timeField \"" + ts.timeField +
+                        "\" must be a DateTime() field of the schema");
+        if (!ts.metaField.empty() && !schema.field(ts.metaField))
+            throw Error("nevla: model \"" + name + "\": timeseries.metaField \"" + ts.metaField +
+                        "\" is not in the schema");
+        if (!ts.granularity.empty() && ts.granularity != "seconds" && ts.granularity != "minutes" &&
+            ts.granularity != "hours")
+            throw Error("nevla: timeseries.granularity must be \"seconds\", \"minutes\" or \"hours\"");
+    }
     auto impl = std::make_shared<ModelImpl>();
     impl->name = name;
     impl->schema = schema;

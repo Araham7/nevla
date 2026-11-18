@@ -1,5 +1,6 @@
 #pragma once
-// nevla: Mongoose-jaisa MongoDB ODM for C++20 (mongocxx ke upar).  #include <nevla/nevla.hpp>
+// nevla: a Mongoose-style MongoDB ODM for C++20 (on top of mongocxx).  #include <nevla/nevla.hpp>
+#include "formula.hpp"
 #include "model.hpp"
 #include "schema.hpp"
 #include "typed.hpp"

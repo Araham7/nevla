@@ -2,6 +2,7 @@
 //   NEVLA_TEST_URI="mongodb://127.0.0.1:27017" ./nevla_tests
 // Transactions and change streams need a replica set (they are skipped on a standalone server).
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <iostream>
 #include <mutex>
@@ -1758,6 +1759,238 @@ static void testAsync() {
     U.dropCollection();
 }
 
+/* ============================ v0.5: time-series, batch writer, fromQuery, schema export ============================
+ */
+static void testTimeSeries() {
+    section("time-series collections");
+    CHECK_THROWS(model("TsBad1", Schema({{"v", Number()}}, {.timeseries = {.timeField = "at"}})),
+                 Error);  // no such field
+    CHECK_THROWS(model("TsBad2", Schema({{"at", String()}}, {.timeseries = {.timeField = "at"}})),
+                 Error);  // not a date
+    CHECK_THROWS(
+        model("TsBad3", Schema({{"at", DateTime()}}, {.timeseries = {.timeField = "at", .granularity = "days"}})),
+        Error);
+    Schema s(
+        {{"device", String().required()}, {"value", Number().required()}, {"at", DateTime().required()}},
+        {.versionKey = "",
+         .timeseries = {
+             .timeField = "at", .metaField = "device", .granularity = "seconds", .expireAfterSeconds = 86400 * 30}});
+    auto Ts = model("TsReading", s, "ts_readings");
+    Ts.dropCollection();
+    std::vector<Value> rows;
+    for (int i = 0; i < 300; i++)
+        rows.push_back({{"device", i % 3 ? "d1" : "d2"}, {"value", i}, {"at", Date{Date::now().ms - i * 1000}}});
+    Ts.insertMany(rows);
+    Value info = Ts.collectionInfo();
+    CHECK(info["type"].asString() == "timeseries");
+    CHECK(info["options"]["timeseries"]["timeField"].asString() == "at" &&
+          info["options"]["timeseries"]["metaField"].asString() == "device");
+    CHECK(info["options"]["expireAfterSeconds"].asInt() == 86400 * 30);
+    CHECK(Ts.countDocuments() == 300 && Ts.countBy("device")["d1"].asInt() == 200);
+    CHECK(Ts.find("device == 'd2' && value >= 150").count() == 50);
+    auto buckets = Ts.aggregate().bucketByTime("at", "1m", {count()}, {.by = "device"}).exec();
+    int64_t total = 0;
+    for (auto &b : buckets) total += b["count"].asInt();
+    CHECK(total == 300);
+    Ts.dropCollection();
+    Ts.create({{"device", "d3"}, {"value", 1}, {"at", Date::now()}});  // dropped -> created again as time-series
+    CHECK(Ts.collectionInfo()["type"].asString() == "timeseries");
+    Ts.createCollection();  // already there: no error
+    auto Plain = model("TsPlain", Schema({{"x", Int()}}));
+    Plain.dropCollection();
+    Plain.createCollection();
+    CHECK(Plain.collectionInfo()["type"].asString() == "collection");
+    Ts.dropCollection();
+    Plain.dropCollection();
+}
+
+static void testBatchWriter() {
+    section("batch writer");
+    auto R = model("BwReading", Schema({{"device", String().required()}, {"value", Number().min(0)}, {"seq", Int()}},
+                                       {.timestamps = true, .versionKey = ""}));
+    R.dropCollection();
+    {
+        auto w = R.batchWriter({.maxDocs = 500, .maxDelayMs = 50});
+        std::vector<std::thread> ts;
+        for (int t = 0; t < 8; t++)
+            ts.emplace_back([&w, t] {
+                for (int i = 0; i < 5000; i++)
+                    w.add({{"device", "d" + std::to_string(t)}, {"value", i}, {"seq", t * 5000 + i}});
+            });
+        for (auto &t : ts) t.join();
+        CHECK_THROWS(w.add({{"value", -1}}), ValidationError);  // checked right away, never queued
+        w.flush();
+        BatchStats st = w.stats();
+        CHECK(st.queued == 40000 && st.written == 40000 && st.failed == 0 && st.batches >= 80);
+        CHECK(R.countDocuments() == 40000 && R.distinct("seq").size() == 40000);
+        CHECK(R.findOne().lean().value()["createdAt"].isDate());  // timestamps applied at add()
+    }
+    // the delay timer writes without flush()
+    {
+        auto w = R.batchWriter({.maxDocs = 1000, .maxDelayMs = 30});
+        for (int i = 0; i < 3; i++) w.add({{"device", "late"}, {"value", i}});
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        CHECK(R.countDocuments({{"device", "late"}}) == 3);
+    }
+    // the destructor writes what is left
+    {
+        auto w = R.batchWriter({.maxDocs = 1000, .maxDelayMs = 60000});
+        for (int i = 0; i < 10; i++) w.add({{"device", "end"}, {"value", i}});
+    }
+    CHECK(R.countDocuments({{"device", "end"}}) == 10);
+    // backpressure: a tiny queue still accepts everything
+    {
+        auto w = R.batchWriter({.maxDocs = 5, .maxDelayMs = 5, .maxQueue = 10});
+        for (int i = 0; i < 2000; i++) w.add({{"device", "bp"}, {"value", i}});
+        w.flush();
+        CHECK(w.stats().written == 2000 && R.countDocuments({{"device", "bp"}}) == 2000);
+    }
+    // duplicate keys: the rest of the batch is still written, the error is reported
+    auto U = model("BwUnique", Schema({{"code", String().unique()}}));
+    U.dropCollection();
+    U.createIndexes();
+    U.create({{"code", "x1"}});
+    {
+        auto w = U.batchWriter({.maxDocs = 100, .maxDelayMs = 20});
+        std::atomic<int64_t> lost{0};
+        std::string msg;
+        w.onError([&](const std::string &m, int64_t n) {
+            lost += n;
+            msg = m;
+        });
+        for (int i = 0; i < 50; i++) w.add({{"code", i % 10 == 0 ? std::string("x1") : "c" + std::to_string(i)}});
+        w.flush();
+        CHECK(lost == 5 && w.stats().failed == 5 && w.stats().written == 45 && msg.find("E11000") != std::string::npos);
+        CHECK(U.countDocuments() == 46);
+    }
+    U.dropCollection();
+    R.dropCollection();
+}
+
+static void testFromQuery() {
+    section("fromQuery (REST parameters)");
+    auto P = model("ApiUser", Schema({{"name", String()},
+                                      {"age", Int()},
+                                      {"role", String()},
+                                      {"city", String()},
+                                      {"joined", DateTime()},
+                                      {"password", String().select(false)}}));
+    P.dropCollection();
+    const char *names[] = {"Asha", "Bo", "Cy", "Dev", "Esha", "a.b"};
+    for (int i = 0; i < 6; i++)
+        P.create({{"name", names[i]},
+                  {"age", 15 + i * 5},
+                  {"role", i % 2 ? "admin" : "user"},
+                  {"city", i < 3 ? "Kolkata" : "Durgapur"},
+                  {"joined", "2026-0" + std::to_string(i + 1) + "-01"},
+                  {"password", "x"}});
+    QueryParamOptions opt{.allow = {"name", "age", "role", "city", "joined"}, .maxLimit = 3, .defaultSort = "name"};
+
+    auto params = parseQueryString("?age%5Bgte%5D=20&role=admin&sort=-age,name&page=1&limit=2&fields=name,age");
+    CHECK(params.at("age[gte]") == "20" && params.at("fields") == "name,age");
+    Page pg = P.fromQuery(params, opt);
+    CHECK(pg.total == 3 && pg.docs.size() == 2 && pg.pages == 2 && pg.hasNext);
+    CHECK(pg.docs[0]["name"].asString() == "a.b" && pg.docs[0]["age"].asInt() == 40);  // sorted -age
+    CHECK(!pg.docs[0].has("role") && !pg.docs[0].has("password"));                     // only the selected fields
+    Value json = pg.toJSON();
+    CHECK(json["docs"].size() == 2 && json["total"].asInt() == 3 && json["hasNext"].asBool());
+
+    CHECK(P.fromQuery({{"city[in]", "Kolkata,Delhi"}}, opt).total == 3);
+    CHECK(P.fromQuery({{"city[nin]", "Kolkata"}}, opt).total == 3);
+    CHECK(P.fromQuery({{"name[contains]", "SH"}}, opt).total == 2);  // case-insensitive
+    CHECK(P.fromQuery({{"name[contains]", "."}}, opt).total == 1);   // "." is literal, not "any character"
+    CHECK(P.fromQuery({{"name[startsWith]", "a"}}, opt).total == 2);
+    CHECK(P.fromQuery({{"joined[lt]", "2026-03-01"}}, opt).total == 2);  // cast to Date
+    CHECK(P.fromQuery({{"age[ne]", "15"}, {"age[lte]", "30"}}, opt).total == 3);
+    CHECK(P.fromQuery({{"role[exists]", "true"}}, opt).total == 6);
+    CHECK(P.fromQuery({{"limit", "50"}}, opt).docs.size() == 3);       // clamped to maxLimit
+    CHECK(P.fromQuery({}, opt).docs[0]["name"].asString() == "Asha");  // defaultSort
+    CHECK(P.fromQuery({{"page", "3"}, {"limit", "2"}}, opt).docs.size() == 2);
+
+    auto rejects = [&](std::map<std::string, std::string> q, const std::string &param) {
+        try {
+            P.fromQuery(q, opt);
+        } catch (const QueryParamError &e) {
+            return e.param == param;
+        }
+        return false;
+    };
+    CHECK(rejects({{"password", "x"}}, "password"));          // not allowed
+    CHECK(rejects({{"$where", "1"}}, "$where"));              // injection attempt
+    CHECK(rejects({{"age[gt]", "abc"}}, "age"));              // cannot be cast
+    CHECK(rejects({{"age[between]", "1"}}, "age[between]"));  // unknown operator
+    CHECK(rejects({{"name[regex]", ".*"}}, "name[regex]"));   // regex off by default
+    CHECK(rejects({{"page", "0"}}, "page"));
+    CHECK(rejects({{"page", "two"}}, "page"));
+    CHECK(rejects({{"sort", "password"}}, "sort"));
+    CHECK(rejects({{"fields", "password"}}, "fields"));
+    CHECK(rejects({{"role[exists]", "maybe"}}, "role[exists]"));
+    CHECK(rejects({{"age[gt", "1"}}, "age[gt"));
+    QueryParamOptions loose = opt;
+    loose.rejectUnknown = false;
+    loose.allowRegex = true;
+    CHECK(P.fromQuery({{"password", "x"}, {"utm_source", "ad"}}, loose).total == 6);  // ignored
+    CHECK(P.fromQuery({{"name[regex]", "^[AB]"}}, loose).total == 2);
+    CHECK_THROWS(P.fromQuery({{"name[regex]", "(("}}, loose), QueryParamError);  // invalid regex
+    P.dropCollection();
+}
+
+static void testSchemaExport() {
+    section("schema export: $jsonSchema, TypeScript, OpenAPI, syncValidator");
+    Schema s({{"name", String().required().minLength(2).maxLength(40)},
+              {"age", Int().min(0).max(150)},
+              {"score", Number()},
+              {"role", String().enumOf({"user", "admin"}).def("user")},
+              {"tags", Array(String())},
+              {"address", Object(Schema({{"city", String().required()}, {"pin", Int()}}))},
+              {"prices", Map(Number())},
+              {"owner", Id()},
+              {"seen", DateTime()},
+              {"extra", Mixed()}},
+             {.timestamps = true});
+    Value js = s.toJsonSchema();
+    CHECK(js["bsonType"].asString() == "object" && js["required"].size() == 2);  // name + _id
+    CHECK(js["properties"]["name"]["bsonType"].asString() == "string" &&
+          js["properties"]["name"]["minLength"].asInt() == 2);
+    CHECK(js["properties"]["age"]["bsonType"].size() == 3 &&
+          js["properties"]["age"]["maximum"].asInt() == 150);  // int,long,null
+    CHECK(js["properties"]["role"]["enum"].size() == 3);       // user, admin, null
+    CHECK(js["properties"]["address"]["properties"]["city"]["bsonType"].asString() == "string");
+    CHECK(js["properties"]["address"]["required"].at(0).asString() == "city");
+    CHECK(js["properties"]["prices"]["additionalProperties"]["bsonType"].size() == 5);
+    CHECK(js["properties"]["createdAt"]["bsonType"].at(0).asString() == "date");
+    CHECK(js["properties"]["extra"].empty());
+
+    std::string ts = s.toTypeScript("User");
+    CHECK(ts.find("export interface User {") == 0);
+    CHECK(ts.find("  _id: string;") != std::string::npos && ts.find("  name: string;") != std::string::npos);
+    CHECK(ts.find("  age?: number;") != std::string::npos &&
+          ts.find("  role: \"user\" | \"admin\";") != std::string::npos);
+    CHECK(ts.find("  tags?: string[];") != std::string::npos &&
+          ts.find("  prices?: Record<string, number>;") != std::string::npos);
+    CHECK(ts.find("    city: string;") != std::string::npos && ts.find("  extra?: unknown;") != std::string::npos);
+    CHECK(ts.find("  createdAt: string;") != std::string::npos && ts.find("  __v?: number;") != std::string::npos);
+
+    Value oa = s.toOpenAPI();
+    CHECK(oa["type"].asString() == "object" && oa["properties"]["age"]["type"].asString() == "integer");
+    CHECK(oa["properties"]["seen"]["format"].asString() == "date-time" && oa["properties"]["_id"]["readOnly"].asBool());
+    CHECK(oa["properties"]["role"]["default"].asString() == "user" && oa["required"].size() == 1);
+
+    // MongoDB enforces the schema itself now: even a schemaless writer is rejected
+    auto Strict = model("ExportUser", s, "export_users");
+    Strict.dropCollection();
+    Strict.syncValidator();
+    Strict.create({{"name", "Asha"}, {"age", 30}, {"address", {{"city", "Durgapur"}}}});
+    auto Raw = model("ExportRaw", Schema({{"name", Mixed()}, {"age", Mixed()}}, {.strict = false}), "export_users");
+    CHECK_THROWS(Raw.create({{"name", "A"}, {"age", 30}}), Error);     // too short
+    CHECK_THROWS(Raw.create({{"name", "Bob"}, {"age", "x"}}), Error);  // wrong type
+    Raw.create({{"name", "Bob"}, {"age", 31}});                        // valid
+    CHECK(Strict.countDocuments() == 2);
+    CHECK(Strict.collectionInfo()["options"]["validator"]["$jsonSchema"]["required"].size() == 2);
+    CHECK_THROWS(Strict.syncValidator("sometimes"), Error);
+    Strict.dropCollection();
+}
+
 int main() {
     testValue();
     testSchemaOffline();
@@ -1792,6 +2025,10 @@ int main() {
     testSlowAndStrict();
     testTypedModels();
     testAsync();
+    testTimeSeries();
+    testBatchWriter();
+    testFromQuery();
+    testSchemaExport();
     disconnect();
     CHECK(!connected());
 

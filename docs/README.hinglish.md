@@ -67,6 +67,7 @@ int main() {
 32. [v0.2 me kya naya hai](#32-v02-me-kya-naya-hai-short-me)
 33. [Aggregation builder (v0.3)](#33-aggregation-builder-v03--aasaan-pipeline)
 34. [v0.4: formula, time buckets, reports, pipeline populate](#34-v04-formula-time-buckets-ek-line-reports-pipeline-me-populate-debugging)
+35. [v0.5: typed model, co_await + Drogon, memory://, plugins, encryption, migrations ...](#35-v05-wo-cheezein-jo-mongoose-me-nahi-hain)
 
 ---
 
@@ -156,7 +157,7 @@ target_link_libraries(myapp PRIVATE nevla::nevla)
 
 ```cmake
 include(FetchContent)
-FetchContent_Declare(nevla GIT_REPOSITORY https://github.com/<tum>/nevla.git GIT_TAG v0.4.0)
+FetchContent_Declare(nevla GIT_REPOSITORY https://github.com/<tum>/nevla.git GIT_TAG v0.5.0)
 FetchContent_MakeAvailable(nevla)
 target_link_libraries(myapp PRIVATE nevla::nevla)
 ```
@@ -1098,7 +1099,7 @@ Pehle chhote (derived) errors pakdo, `Error` sabse aakhir me.
 
 - nevla **thread-safe** hai: ek hi `Model` ko kai threads se ek saath use karo (andar connection pool hai).
 - Ek hi `Document` object ko do threads me ek saath mat badlo. Har thread apna document load kare.
-- Saare calls **blocking** hain (jawab aane tak rukte hain). Mongoose ki tarah `await` nahi hai.
+- Normal calls **blocking** hain (jawab aane tak rukte hain). Coroutine me `co_await ...Async()` use karo (section 35).
 
 Blocking kaam ko alag thread par bhejna ho:
 
@@ -1108,7 +1109,7 @@ auto fut = nevla::async([&] { return User.find({{"active", true}}).lean(); });
 std::vector<Value> users = fut.get();     // exception ho to yahan aata hai
 ```
 
-Event-loop wale server (Drogon, Boost.Asio…) me DB call ko event-loop thread par seedha mat chalao; worker thread pool par bhejo, warna us dauran baaki requests rukti hain.
+Event-loop wale server (Drogon, Boost.Asio…) me blocking call event-loop thread par seedha mat chalao, warna us dauran baaki requests rukti hain. Wahan `co_await User.find(...).leanAsync()` likho aur Drogon me `nevla::useDrogonLoop()` ek baar call karo (section 35).
 
 ---
 
@@ -1204,7 +1205,7 @@ l.set("aurBhi", "haan").save();
 
 - `doc.name` nahi ho sakta → `doc["name"]` padhne ke liye, `doc.set("name", v)` likhne ke liye.
 - `doc["name"]` sirf padhne ka hai. Seedha badalna ho to `doc.mut("path")`.
-- `await` nahi: sab blocking hai. `nevla::async()` madad ke liye hai.
+- `await` ki jagah `co_await` (`...Async()` wale functions, section 35).
 - `virtual` C++ ka keyword hai, isliye `virtual_()`.
 
 **Jaan-boojh kar alag:**
@@ -1216,8 +1217,7 @@ l.set("aurBhi", "haan").save();
 **Abhi nahi hai (aage jod sakte ho):**
 
 - types: `Decimal128`, `Buffer` (binary), `BigInt`
-- callback / coroutine wali async API
-- `Query.explain()`, `Model.translateAliases()`
+- `Model.translateAliases()`
 
 ---
 
@@ -1237,9 +1237,11 @@ nevla/
 │   ├── 02_blog.cc            populate, hooks, virtuals, methods
 │   ├── 03_iot.cc             custom _id, discriminators, TTL, aggregate, transaction
 │   ├── 04_typed_struct.cc    NEVLA_STRUCT
+│   ├── 05_features.cc        v0.2: statics, plugin, Map, getters, virtual populate, paginate, cursor, bulkWrite
 │   ├── 06_iot_dashboard.cc   end-to-end: threads se data bhejo + dashboard, har number verify
-│   └── 05_features.cc        v0.2: statics, plugin, Map, getters, virtual populate, paginate, cursor, bulkWrite
-├── tests/test.cc      471 checks, asli MongoDB par
+│   ├── 07_offline_api.cc     v0.5 ka tour, bina MongoDB ke (memory://)
+│   └── 08_drogon.cc          Drogon + co_await (Drogon installed ho tabhi build hota hai)
+├── tests/test.cc      MongoDB par 1658 checks, memory:// par 708
 ├── CMakeLists.txt
 ├── LICENSE            MIT
 └── README.md
@@ -1247,7 +1249,9 @@ nevla/
 
 ```bash
 cd build
-./nevla_tests        # "471 passed, 0 failed"
+./nevla_tests        # "1658 passed, 0 failed"
+NEVLA_TEST_URI=memory://t ./nevla_tests   # "708 passed, 0 failed" (bina server ke)
+ctest                # sab ek saath (7 tests)
 ./01_quickstart
 ./02_blog
 ./03_iot
@@ -1465,6 +1469,10 @@ Order.aggregate()
             ^
   ```
 - **Accumulator me formula:** naam dena zaroori hai, jaise `sum("price * qty").as("revenue")`.
+- **Dhyan do (0.4 se badla):** jahan filter chahiye wahan string ab formula maani jaati hai. Pehle string
+  ignore ho jaati thi, to `User.find("kuch bhi")` saare documents de deta tha. Ab `find("age >= 18")` asli filter
+  hai, aur akela shabd field ka test hai: `find("active")` matlab `{active: true}`. Galat spelling bhi pakadni
+  ho to `strictQuery` on karo (section 35).
 
 ### Chart ke liye time buckets: `bucketByTime`
 
@@ -1515,6 +1523,165 @@ std::cout << agg.plan();      // "IXSCAN(value_1)" = index laga;  "COLLSCAN" = p
 
 Is version ko `06_iot_dashboard` se bhi test kiya: 8 threads ne 1 lakh readings bheji, 5 threads ek saath dashboards
 chala rahe the, aur formula, buckets, countBy, stats, populate, sabke result bheje gaye data se match hue.
+
+---
+
+## 35. v0.5: wo cheezein jo Mongoose me nahi hain
+
+Pehle ek seedha sawaal: **nevla khud ka driver hai?** Nahi. Neeche MongoDB ka official **mongocxx** driver hai.
+Network, connection pool, TLS, login aur replica set wo sambhalta hai. nevla uske upar ODM layer hai (schema,
+validation, hooks, populate ...). Sirf `memory://` wala test-database nevla ka apna engine hai.
+
+### Typed model: galti compile time pe pakdi jaaye
+
+```cpp
+struct Device { std::string id, name, room; double temp = 0; bool online = false; std::vector<std::string> tags; };
+NEVLA_STRUCT(Device, id, name, room, temp, online, tags)
+
+TypedModel<Device> Devices("Device");          // schema struct se khud ban jaata hai
+Device d = Devices.create({.name = "temp-1", .room = "lab", .temp = 24.5});
+auto hot = Devices.find().where(&Device::temp).gte(30).lt(60).sort(&Device::temp, -1).limit(10).exec();
+Devices.update(d.id).set(&Device::temp, 26.0).push(&Device::tags, "calibrated").exec();
+```
+
+`&Device::tmep` likha (spelling galat) ya `temp` ko `"hot"` se compare kiya, to **program compile hi nahi hoga**.
+Mongoose me aisi galti chup-chaap khaali result deti hai. Rules chahiye to `schemaOf<Device>()` lo aur `add()` karo.
+
+### `co_await` (Drogon ke saath bhi)
+
+```cpp
+Task<int64_t> dashboard(Model Users) {
+    auto adults = co_await Users.find("age >= 18").countAsync();
+    auto rows   = co_await Users.find("role == 'admin'").limit(5).leanAsync();
+    co_return adults;
+}
+```
+
+- DB ka kaam nevla ke thread pool pe hota hai; event loop thread kabhi nahi rukta.
+- **Kisi bhi coroutine type** me chalta hai: `drogon::Task<>`, Asio, ya nevla ka apna `Task<T>`. Koi adapter nahi.
+- **Drogon me ek line zaroor likho:** `nevla::useDrogonLoop();` (`#include <nevla/drogon.hpp>`).
+  Iske bina `co_await` ke baad handler nevla ke pool thread pe chalta, Drogon ke IO loop pe nahi. Iske saath
+  har handler usi IO loop pe wapas aata hai jahan se shuru hua tha. `08_drogon --check` ye 400 requests
+  pe check karta hai (bina is line ke 400+ handler galat thread pe milte hain, test fail).
+- Drogon nahi, koi aur loop hai? `nevla::setResumeOn(...)` se apna loop batao (English README me example).
+- Validation error ko 400 banana: `e.toJSON()` deta hai `{"email": "Path `email` is required."}`.
+
+**GCC 13 ka bug:** `co_await` wali line me `{{"name", "x"}}` jaisi braces likhi to GCC 13 khud crash ho jaata
+hai (*internal compiler error*). Function me lapetne se bhi nahi bachta. Isliye braces ki jagah ye likho:
+
+```cpp
+co_await User.createAsync(nevla::obj("name", "Asha", "age", 21));
+co_await User.find(nevla::obj("age", nevla::obj("$gte", 18))).countAsync();
+co_await User.find("age >= 18").countAsync();      // ya formula
+```
+
+GCC 14+, Clang me braces bhi chalte hain.
+
+### `memory://`: bina MongoDB ke test
+
+```cpp
+connect("memory://test");      // database program ke andar hi, koi server nahi
+```
+
+Wahi code, wahi API. Unit test ke liye perfect: na MongoDB install, na Docker, na download (Node ka
+`mongodb-memory-server` to asli mongod download karta hai). nevla ka test suite iske upar 708 checks chalata hai,
+aur 930 random queries asli MongoDB aur memory dono pe chala ke result match karta hai.
+**Production ke liye nahi:** ek global lock hai, aur process band hote hi data gaya. Change streams, collation,
+`$text`, geo, `$where` jaisi cheezein saaf error deti hain.
+
+### `strictQuery`: field ki spelling galat to error
+
+```cpp
+nevla::setStrictQuery(true);
+User.find({{"emial", "a@x.in"}}).exec();
+// Error: unknown path "emial" in a filter on model "User" (strictQuery). Did you mean "email"?
+```
+
+### Slow query log
+
+```cpp
+nevla::setSlowQueryThreshold(100);   // 100 ms se dheemi query stderr pe, index ka sujhav bhi
+```
+
+### Time-series collection (sensor data ke liye, MongoDB 5.0+)
+
+```cpp
+Schema s({{"device", String()}, {"value", Number()}, {"at", DateTime().required()}},
+         {.timeseries = {.timeField = "at", .metaField = "device", .expireAfterSeconds = 90 * 86400}});
+```
+
+### Batch writer (MQTT jaisa tez data)
+
+```cpp
+auto writer = Reading.batchWriter({.maxDocs = 500, .maxDelayMs = 200});
+writer.add({{"device", id}, {"value", 30.5}, {"at", Date::now()}});   // validation abhi, likhna background me
+writer.flush();
+```
+
+500 docs ho gaye ya 200 ms ho gaye, to ek `insertMany`. Queue bhar gayi to `add()` ruk jaata hai (memory nahi phoolti).
+
+### `fromQuery`: URL se seedha query
+
+```cpp
+// GET /users?age[gte]=18&city[in]=Kolkata,Durgapur&sort=-createdAt&page=2&limit=20&fields=name,email
+Page page = User.fromQuery(nevla::parseQueryString(req->query()), {.allow = {"age", "city", "createdAt"}});
+return page.toJSON();     // {docs, total, page, perPage, pages, hasNext, hasPrev}
+```
+
+Jo field `allow` me nahi, wo `QueryParamError` (400 bhejo). `"18"` → number, `"2026-11-01"` → Date apne aap.
+
+### Schema export + MongoDB validator
+
+```cpp
+userSchema.toTypeScript("User");   // React dashboard ke liye TypeScript interface
+userSchema.toOpenAPI();            // Swagger
+User.syncValidator();              // schema MongoDB me hi validator ban ke baith jaata hai
+nevla::syncValidators();           // saare models ek saath (deploy step / CLI ke liye)
+```
+
+Validator ke baad mongosh ya Python se bhi galat data nahi ghus sakta.
+
+### Plugins: soft delete, history, multi-tenant
+
+```cpp
+schema.plugin(nevla::plugins::softDelete);   // doc.call("softDelete") -> find() me chhup jaata hai, restore bhi
+schema.plugin(nevla::plugins::history);      // har badlav ka record: kisne, kab, kya
+schema.plugin(nevla::plugins::multiTenant);  // har company ka data alag
+
+nevla::TenantScope t("acme");                // is request ki saari queries sirf "acme" ki
+nevla::ActorScope who("araham@acme.in");     // history me "kisne"
+```
+
+Tenant set nahi kiya to error. Galti se doosri company ka data kabhi nahi dikhega.
+
+### Field encryption
+
+```cpp
+nevla::setEncryptionKey(std::getenv("NEVLA_KEY"));
+Schema s({{"aadhaar", String().encrypted()},       // sabse safe, search nahi hoga
+          {"token",   String().encrypted(true)}});  // isse == se dhundh sakte ho
+```
+
+AES-256-GCM. Database me sirf `nvenc:1:...` dikhta hai. Key kho gayi to data bhi gaya; key database me mat rakho.
+
+### Migrations
+
+```cpp
+nevla::migration("2026-11-20-add-plan",
+    [] { User.updateMany(Value::object(), {{"plan", "free"}}); },
+    [] { User.updateMany(Value::object(), {{"$unset", {{"plan", ""}}}}); });
+nevla::migrate();     // jo nahi chali wahi chalegi; do server ek saath start hon to bhi ek hi baar
+nevla::rollback();
+```
+
+### findById cache
+
+```cpp
+User.cache({.ttlMs = 30000});   // findById memory se; nevla se koi bhi write hua to cache saaf
+```
+
+Pura example: `examples/07_offline_api.cc` (bina MongoDB ke chalta hai) aur `examples/08_drogon.cc`.
+Har cheez ki detail English README me hai.
 
 ---
 

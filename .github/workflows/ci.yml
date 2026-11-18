@@ -57,11 +57,10 @@ jobs:
       - name: Build
         run: cmake --build build -j$(nproc)
 
-      - name: Test
+      - name: Test (MongoDB, memory://, compile-fail checks)
         env:
           LD_LIBRARY_PATH: /opt/mongocxx/lib
-          NEVLA_TEST_URI: mongodb://127.0.0.1:27017/?directConnection=true
-        run: ./build/nevla_tests
+        run: cd build && ctest --output-on-failure
 
       - name: Examples
         env:
@@ -69,3 +68,4 @@ jobs:
         run: |
           for e in 01_quickstart 02_blog 03_iot 04_typed_struct 05_features; do ./build/$e > /dev/null; done
           ./build/06_iot_dashboard 500
+          ./build/07_offline_api > /dev/null

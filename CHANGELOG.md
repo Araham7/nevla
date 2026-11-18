@@ -3,6 +3,52 @@
 All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses [Semantic Versioning](https://semver.org/).
 
+## [0.5.0] - 2026-11-19
+
+### Added (features Mongoose does not have)
+- **Typed models**: `TypedModel<T>` on a `NEVLA_STRUCT`, queries and updates with member pointers
+  (`where(&Device::temp).gte(30)`, `update(id).push(&Device::tags, "x")`); typos and wrong value types are
+  compile errors (checked by `tests/compile_fail`). `schemaOf<T>()` builds a schema from the struct.
+- **co_await**: `...Async()` forms of queries, writes, aggregate and `saveAsync()` returning `Async<T>`, usable
+  from any coroutine type (`drogon::Task<>`, Asio, ...); `nevla::Task<T>` for code without one; `asyncCall()`.
+  Tenant / actor scope travels into the pool thread.
+- **Resume on the awaiting event loop**: `setResumeOn(capture)`; `<nevla/drogon.hpp>` with `useDrogonLoop()`.
+- `obj(...)` / `arr(...)`: build Values without braced lists (GCC 13 crashes on `{{...}}` inside `co_await`).
+- **In-memory database**: `connect("memory://name")`, a MongoDB-compatible engine for tests and demos
+  (CRUD, updates, unique indexes, `$jsonSchema`, aggregation, transactions). Checked against MongoDB by a
+  differential test (930 comparisons).
+- **strictQuery** (schema option or `setStrictQuery(true)`): an unknown filter path throws, with
+  "Did you mean ...?".
+- **Slow query log**: `setSlowQueryThreshold(ms, fn)` with an index suggestion (ESR rule).
+- **Time-series collections**: `SchemaOptions::timeseries` (time / meta field, granularity, expiry).
+- **Batch writer**: `Model::batchWriter({.maxDocs, .maxDelayMs, .maxQueue, .ordered})` with backpressure,
+  `flush()`, `stats()`, `onError()`.
+- **REST query parameters**: `Model::fromQuery(params, {.allow, ...})`, `parseQueryString()`, `Page::toJSON()`,
+  `QueryParamError`.
+- **Schema export**: `toJsonSchema()`, `toOpenAPI()`, `toTypeScript(name)`; `Model::syncValidator()` stores the
+  schema as MongoDB's `$jsonSchema` validator; `syncValidators()` for every model; `createCollection()`,
+  `collectionInfo()`.
+- **Plugins**: `plugins::softDelete`, `plugins::history` (audit log, `ActorScope`), `plugins::multiTenant`
+  (`TenantScope`, `AllTenantsScope`; no tenant = error).
+- **Field encryption**: `String().encrypted()` (random IV) and `.encrypted(true)` (deterministic, equality
+  filters work), AES-256-GCM via OpenSSL, `setEncryptionKey()`.
+- **Migrations**: `migration(id, up, down)`, `migrate()` (with a lock against two servers),
+  `rollback()`, `migrationStatus()`.
+- **findById cache**: `Model::cache({.ttlMs, .maxEntries})`, cleared by every write through nevla.
+- `ValidationError::toJSON()` (`{path: message}` for a 400 body), `dropDatabase()`.
+- Examples `07_offline_api` (runs on `memory://`) and `08_drogon` (built when Drogon is found;
+  `08_drogon --check` is a CTest test: 400 concurrent requests must all resume on their IO loop).
+- CI runs `ctest` (MongoDB suite, memory suite, compile-fail checks) and example 07.
+
+### Fixed
+- `syncValidator()` on a discriminator child replaced the base model's validator for the whole collection;
+  it now throws, and `syncValidators()` skips children.
+- Typed `push()` / `pull()` did not compile with a string literal.
+- `distinct()` and `bulkWrite()` now run query middleware (needed by the plugins).
+
+### Changed
+- nevla now links OpenSSL (`libcrypto`) for field encryption.
+
 ## [0.4.0] - 2026-11-18
 
 ### Added

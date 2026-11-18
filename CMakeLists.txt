@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.16)
-project(nevla VERSION 0.4.0 LANGUAGES CXX)
+project(nevla VERSION 0.5.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -68,7 +68,7 @@ if(NEVLA_BUILD_EXAMPLES)
   endif()
 endif()
 
-# sudo cmake --install build  ->  find_package(nevla 0.2 CONFIG REQUIRED) ; target_link_libraries(app nevla::nevla)
+# sudo cmake --install build  ->  find_package(nevla 0.5 CONFIG REQUIRED) ; target_link_libraries(app nevla::nevla)
 include(GNUInstallDirs)
 install(TARGETS nevla EXPORT nevlaTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR} LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR})
 install(DIRECTORY include/nevla DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})

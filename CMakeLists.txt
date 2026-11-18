@@ -23,12 +23,13 @@ else()
   set(NEVLA_MONGOCXX mongo::mongocxx_static)
 endif()
 
-add_library(nevla src/value.cc src/schema.cc src/model.cc src/formula.cc)
+add_library(nevla src/value.cc src/schema.cc src/model.cc src/formula.cc src/async.cc)
 add_library(nevla::nevla ALIAS nevla)
 target_include_directories(nevla PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
   $<INSTALL_INTERFACE:include>)
-target_link_libraries(nevla PUBLIC ${NEVLA_MONGOCXX})
+find_package(Threads REQUIRED)
+target_link_libraries(nevla PUBLIC ${NEVLA_MONGOCXX} Threads::Threads)
 target_compile_options(nevla PRIVATE -Wall -Wextra)
 
 if(NEVLA_BUILD_TESTS)
@@ -36,6 +37,15 @@ if(NEVLA_BUILD_TESTS)
   add_executable(nevla_tests tests/test.cc)
   target_link_libraries(nevla_tests PRIVATE nevla)
   add_test(NAME nevla_tests COMMAND nevla_tests)
+  # Typed models: these files must be rejected by the compiler (typos / wrong types are compile errors)
+  foreach(cf typo_member wrong_value_type inc_on_string ok_control)
+    add_test(NAME compile_${cf}
+             COMMAND ${CMAKE_CXX_COMPILER} -std=c++20 -fsyntax-only -I${CMAKE_CURRENT_SOURCE_DIR}/include
+                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/compile_fail/${cf}.cc)
+    if(NOT cf STREQUAL "ok_control")
+      set_tests_properties(compile_${cf} PROPERTIES WILL_FAIL TRUE)
+    endif()
+  endforeach()
 endif()
 
 if(NEVLA_BUILD_EXAMPLES)
@@ -51,7 +61,7 @@ install(TARGETS nevla EXPORT nevlaTargets ARCHIVE DESTINATION ${CMAKE_INSTALL_LI
 install(DIRECTORY include/nevla DESTINATION ${CMAKE_INSTALL_INCLUDEDIR})
 install(EXPORT nevlaTargets NAMESPACE nevla:: DESTINATION ${CMAKE_INSTALL_LIBDIR}/cmake/nevla)
 file(WRITE ${CMAKE_CURRENT_BINARY_DIR}/nevlaConfig.cmake
-"include(CMakeFindDependencyMacro)\nfind_dependency(mongocxx)\ninclude(\${CMAKE_CURRENT_LIST_DIR}/nevlaTargets.cmake)\n")
+"include(CMakeFindDependencyMacro)\nfind_dependency(mongocxx)\nfind_dependency(Threads)\ninclude(\${CMAKE_CURRENT_LIST_DIR}/nevlaTargets.cmake)\n")
 include(CMakePackageConfigHelpers)
 write_basic_package_version_file(${CMAKE_CURRENT_BINARY_DIR}/nevlaConfigVersion.cmake
   VERSION ${PROJECT_VERSION} COMPATIBILITY SameMinorVersion)

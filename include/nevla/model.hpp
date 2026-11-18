@@ -14,6 +14,7 @@
 #include <string>
 #include <vector>
 
+#include "async.hpp"
 #include "formula.hpp"
 #include "schema.hpp"
 
@@ -123,8 +124,11 @@ class Document {
     bool isModified(std::string_view path = "") const;
     std::vector<std::string> modifiedPaths() const;
 
-    void validate();   // throws ValidationError
-    Document &save();  // new: insert, existing: only the changed paths ($set / $unset)
+    void validate();           // throws ValidationError
+    Document &save();          // new: insert, existing: only the changed paths ($set / $unset)
+    Async<void> saveAsync() {  // the Document must stay alive until the co_await finishes
+        return Async<void>([this] { save(); });
+    }
     void deleteOne();
     UpdateResult updateOne(const Value &update, UpdateOptions options = {});  // Model.updateOne({_id}, update)
     Document &increment();                                                    // next save() bumps the version key (__v)
@@ -322,6 +326,20 @@ class Query : public QueryBase<Query> {
     void forEach(const std::function<void(Document &)> &fn);  // stream every matching document
     Page paginate(int64_t page, int64_t perPage);             // page starts at 1
 
+    // co_await versions (run on nevla's thread pool, see async.hpp)
+    Async<std::vector<Document>> execAsync() const {
+        Query q = *this;
+        return Async<std::vector<Document>>([q]() mutable { return q.exec(); });
+    }
+    Async<std::vector<Value>> leanAsync() const {
+        Query q = *this;
+        return Async<std::vector<Value>>([q]() mutable { return q.lean(); });
+    }
+    Async<int64_t> countAsync() const {
+        Query q = *this;
+        return Async<int64_t>([q]() mutable { return q.count(); });
+    }
+
   private:
     friend class Model;
     using QueryBase::QueryBase;
@@ -332,6 +350,14 @@ class QueryOne : public QueryBase<QueryOne> {
     std::optional<Document> exec();
     std::optional<Value> lean();
     Document orFail();  // NotFoundError if nothing matches
+    Async<std::optional<Document>> execAsync() const {
+        QueryOne q = *this;
+        return Async<std::optional<Document>>([q]() mutable { return q.exec(); });
+    }
+    Async<std::optional<Value>> leanAsync() const {
+        QueryOne q = *this;
+        return Async<std::optional<Value>>([q]() mutable { return q.lean(); });
+    }
 
   private:
     friend class Model;
@@ -439,7 +465,11 @@ class Aggregate {
         return out;
     }
     std::optional<Value> first() const;  // only the first result (adds $limit 1)
-    Value pipeline() const;              // the stages as they will be sent (incl. discriminator $match)
+    Async<std::vector<Value>> execAsync() const {
+        Aggregate a = *this;
+        return Async<std::vector<Value>>([a] { return a.exec(); });
+    }
+    Value pipeline() const;  // the stages as they will be sent (incl. discriminator $match)
     std::string toJson(int indent = 2) const { return pipeline().toJson(indent); }
     std::string toShell() const;  // db.readings.aggregate([...]) with ObjectId(...) / ISODate(...): paste into mongosh
     Value explain() const;        // MongoDB's query plan (queryPlanner)
@@ -519,6 +549,36 @@ class Model {
     ChangeStream watch(const Value &pipeline = Value::array(), WatchOptions options = {}) const;  // replica set
 
     Value call(const std::string &staticName, const Value &args = Value()) const;  // schema.static_()
+
+    // co_await versions of the common writes (reads: find(...).execAsync() / leanAsync() / countAsync())
+    Async<Document> createAsync(Value object) const {
+        Model m = *this;
+        return Async<Document>([m, object] { return m.create(object); });
+    }
+    Async<std::vector<Document>> insertManyAsync(std::vector<Value> objects, InsertManyOptions o = {}) const {
+        Model m = *this;
+        return Async<std::vector<Document>>([m, objects, o] { return m.insertMany(objects, o); });
+    }
+    Async<UpdateResult> updateOneAsync(Value filter, Value update, UpdateOptions o = {}) const {
+        Model m = *this;
+        return Async<UpdateResult>([m, filter, update, o] { return m.updateOne(filter, update, o); });
+    }
+    Async<UpdateResult> updateManyAsync(Value filter, Value update, UpdateOptions o = {}) const {
+        Model m = *this;
+        return Async<UpdateResult>([m, filter, update, o] { return m.updateMany(filter, update, o); });
+    }
+    Async<int64_t> deleteOneAsync(Value filter) const {
+        Model m = *this;
+        return Async<int64_t>([m, filter] { return m.deleteOne(filter); });
+    }
+    Async<int64_t> deleteManyAsync(Value filter) const {
+        Model m = *this;
+        return Async<int64_t>([m, filter] { return m.deleteMany(filter); });
+    }
+    Async<int64_t> countDocumentsAsync(Value filter = Value::object()) const {
+        Model m = *this;
+        return Async<int64_t>([m, filter] { return m.countDocuments(filter); });
+    }
 
     void createIndexes() const;  // create the schema's indexes now (throws on failure)
     void syncIndexes() const;    // createIndexes() + drop indexes that are no longer in the schema

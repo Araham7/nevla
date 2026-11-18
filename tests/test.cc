@@ -1991,6 +1991,230 @@ static void testSchemaExport() {
     Strict.dropCollection();
 }
 
+/* ============================ v0.5: plugins (softDelete, history, multiTenant), encryption
+ * ============================ */
+static void testSoftDelete() {
+    section("plugin: softDelete");
+    Schema s({{"name", String()}, {"age", Int()}});
+    s.plugin(plugins::softDelete);
+    auto M = model("SdUser", s);
+    M.dropCollection();
+    auto a = M.create({{"name", "a"}, {"age", 20}});
+    auto b = M.create({{"name", "b"}, {"age", 40}});
+    M.create({{"name", "c"}, {"age", 60}});
+    CHECK(b.call("softDelete").asBool() && b.call("isDeleted").asBool() && !a.call("isDeleted").asBool());
+    CHECK(M.find().count() == 2 && M.countDocuments() == 2);
+    CHECK(!M.findById(b._id()).lean());
+    CHECK(M.find({{"$withDeleted", true}}).count() == 3);
+    CHECK(M.find({{"deletedAt", {{"$ne", nullptr}}}}).count() == 1);  // only the deleted
+    CHECK(M.aggregate().group("", {count()}).first().value()["count"].asInt() == 2);
+    CHECK(M.aggregate().match({{"$withDeleted", true}}).group("", {count()}).first().value()["count"].asInt() == 3);
+    CHECK(M.countBy("name").size() == 2 && M.distinct("name").size() == 2);
+    CHECK(M.updateMany(Value::object(), {{"$inc", {{"age", 1}}}}).matchedCount == 2);  // deleted ones untouched
+    CHECK(M.call("softDelete", "age > 50").asInt() == 1 && M.countDocuments() == 1);
+    CHECK(M.call("restore", Value::object()).asInt() == 2 && M.countDocuments() == 3);
+    auto again = M.findById(b._id()).orFail();
+    again.call("softDelete");
+    again.call("restore");
+    CHECK(M.countDocuments() == 3 && !M.findById(b._id()).lean().value().contains("deletedAt"));
+    CHECK(M.deleteMany(Value::object()) == 3);  // a hard delete still deletes
+
+    Schema s2({{"title", String()}});
+    plugins::softDelete(s2, {{"field", "removedAt"}});
+    auto P = model("SdPost", s2);
+    P.dropCollection();
+    P.create({{"title", "x"}}).call("softDelete");
+    CHECK(P.countDocuments() == 0 && P.find({{"removedAt", {{"$exists", true}}}}).count() == 1);
+    P.dropCollection();
+    M.dropCollection();
+}
+
+static void testHistory() {
+    section("plugin: history (audit log)");
+    Schema s({{"name", String().required()}, {"plan", String()}, {"pin", String().encrypted()}});
+    s.plugin(plugins::history, {{"collection", "test_history"}});
+    auto M = model("HistUser", s);
+    M.dropCollection();
+    auto store = model("HistRaw", Schema({}, {.strict = false}), "test_history");
+    store.dropCollection();
+    setEncryptionKey("history test key");
+    Value id;
+    {
+        ActorScope who("asha@x.in");
+        auto d = M.create({{"name", "Asha"}, {"plan", "free"}, {"pin", "1234"}});
+        id = d._id();
+        d.set("plan", "pro").save();
+        d.save();                                                  // nothing changed: no entry
+        CHECK_THROWS(M.create({{"plan", "x"}}), ValidationError);  // failed save: no entry
+        M.updateOne({{"_id", id}}, {{"plan", "team"}});
+        M.updateOne({{"name", "nobody"}}, {{"plan", "x"}});  // matched nothing: no entry
+        M.findById(id).orFail().deleteOne();
+    }
+    Value h = M.call("history", id);
+    CHECK(h.size() == 3);  // create, update, delete (updateOne is filter-based)
+    if (h.size() == 3) {
+        CHECK(h.at(0)["op"].asString() == "create" && h.at(0)["by"].asString() == "asha@x.in");
+        CHECK(h.at(0)["changes"]["pin"].asString() == "[encrypted]");  // secrets never reach the log
+        CHECK(h.at(1)["op"].asString() == "update" && h.at(1)["changes"].size() == 1 &&
+              h.at(1)["changes"]["plan"].asString() == "pro");
+        CHECK(h.at(2)["op"].asString() == "delete" && h.at(2)["at"].isDate());
+    }
+    Value all = M.call("history", Value());
+    CHECK(all.size() == 4);
+    bool sawUpdateOne = false;
+    for (const auto &e : all.elements())
+        if (e["op"].asString() == "updateOne")
+            sawUpdateOne = e["result"]["modifiedCount"].asInt() == 1 && e["by"].asString() == "asha@x.in";
+    CHECK(sawUpdateOne);
+    clearEncryptionKey();
+    store.dropCollection();
+    M.dropCollection();
+}
+
+static Task<int64_t> tenantCount(Model M) { co_return co_await M.find().countAsync(); }
+
+static void testMultiTenant() {
+    section("plugin: multiTenant");
+    Schema s({{"name", String()}, {"n", Int().def(0)}});
+    s.plugin(plugins::multiTenant);
+    auto M = model("MtItem", s);
+    {
+        AllTenantsScope admin;
+        M.dropCollection();
+    }
+    CHECK_THROWS(M.create({{"name", "x"}}), Error);  // no tenant: refused, never unscoped
+    CHECK_THROWS(M.find().count(), Error);
+    Value acmeId;
+    {
+        TenantScope t("acme");
+        CHECK(currentTenant() == "acme");
+        acmeId = M.create({{"name", "a1"}})._id();
+        M.create({{"name", "a2"}});
+        CHECK(M.countDocuments() == 2);
+        CHECK(M.find({{"tenantId", "globex"}}).count() == 2);  // cannot ask for another tenant
+        CHECK(tenantCount(M).get() == 2);                      // follows into co_await
+        auto w = M.batchWriter({.maxDocs = 10, .maxDelayMs = 10});
+        w.add({{"name", "a3"}});
+        w.flush();
+        CHECK(M.countDocuments() == 3);
+    }
+    {
+        TenantScope t("globex");
+        auto g = M.create({{"name", "g1"}});
+        CHECK(g["tenantId"].asString() == "globex" && M.countDocuments() == 1);
+        CHECK(!M.findById(acmeId).lean());  // acme's document is invisible
+        CHECK(M.updateMany(Value::object(), {{"$inc", {{"n", 1}}}}).matchedCount == 1);
+        CHECK(M.updateOne({{"_id", g._id()}}, {{"tenantId", "acme"}}).modifiedCount == 0);  // tenant cannot change
+        CHECK(M.aggregate().group("", {count()}).first().value()["count"].asInt() == 1);
+        CHECK(M.distinct("name").size() == 1 && M.countBy("name").size() == 1);
+        CHECK(M.bulkWrite({{{"deleteMany", {{"filter", Value::object()}}}}}).deletedCount == 1);  // only globex
+        M.replaceOne({{"name", "nothing"}}, {{"name", "r"}}, {.upsert = true});
+        CHECK(M.findOne({{"name", "r"}}).lean().value()["tenantId"].asString() == "globex");
+    }
+    std::optional<Document> acmeDoc;
+    {
+        TenantScope t("acme");
+        acmeDoc = M.findById(acmeId).exec();
+        CHECK(acmeDoc && M.deleteMany({{"name", "r"}}) == 0);  // globex's "r" is not acme's
+    }
+    {
+        TenantScope t("globex");
+        acmeDoc->set("name", "stolen");
+        CHECK_THROWS(acmeDoc->save(), Error);  // a document of another tenant cannot be saved here
+    }
+    {
+        AllTenantsScope admin;
+        CHECK(!currentTenant() && M.countDocuments() == 4 && M.countBy("tenantId").size() == 2);
+        M.dropCollection();
+    }
+}
+
+static void testEncryption() {
+    section("field encryption (AES-256-GCM)");
+    CHECK_THROWS(Int().encrypted(), Error);
+    Schema s({{"name", String()},
+              {"ssn", String().encrypted().minLength(4)},
+              {"token", String().encrypted(true)},
+              {"notes", Array(String().encrypted())},
+              {"bank", Object(Schema({{"ifsc", String()}, {"account", String().encrypted()}}))},
+              {"cards", Array(Schema({{"last4", String()}, {"number", String().encrypted()}}))}});
+    auto M = model("EncUser", s);
+    auto Raw = model("EncRaw", Schema({}, {.strict = false}), "encusers");
+    clearEncryptionKey();
+    M.dropCollection();
+    CHECK_THROWS(M.create({{"name", "x"}, {"ssn", "1234-5678"}}), Error);  // no key yet
+
+    setEncryptionKey("correct horse battery staple");
+    Value data{{"name", "Asha"},
+               {"ssn", "1234-5678"},
+               {"token", "tok-123"},
+               {"notes", Value::array({"n1", "n2"})},
+               {"bank", {{"ifsc", "SBIN0001"}, {"account", "000111222"}}},
+               {"cards", Value::array({{{"last4", "4242"}, {"number", "4242424242424242"}}})}};
+    auto a = M.create(data);
+    CHECK(a["ssn"].asString() == "1234-5678");  // the Document keeps plain text
+    M.create({{"name", "Bo"}, {"ssn", "1234-5678"}, {"token", "tok-123"}});
+
+    // what is really stored (read without the key: nevla decrypts every result while a key is set)
+    auto rawRead = [&](const Value &filter) {
+        clearEncryptionKey();
+        auto v = Raw.findOne(filter).lean();
+        setEncryptionKey("correct horse battery staple");
+        return v.value_or(Value());
+    };
+    std::vector<Value> raw{rawRead({{"name", "Asha"}})};
+    CHECK(raw.size() == 1);
+    const Value &r = raw[0];
+    CHECK(r["ssn"].asString().rfind("nvenc:1:", 0) == 0 && r["ssn"].asString().find("1234") == std::string::npos);
+    CHECK(r["notes"].at(0).asString().rfind("nvenc:1:", 0) == 0 &&
+          r["bank"]["account"].asString().rfind("nvenc:1:", 0) == 0);
+    CHECK(r["bank"]["ifsc"].asString() == "SBIN0001" &&
+          r["cards"].at(0)["number"].asString().rfind("nvenc:1:", 0) == 0);
+    auto rawBo = rawRead({{"name", "Bo"}});
+    CHECK(rawBo["ssn"] != r["ssn"]);      // random IV: equal values look different
+    CHECK(rawBo["token"] == r["token"]);  // deterministic: equal values look equal (so they can be found)
+
+    auto back = M.findById(a._id()).orFail();
+    CHECK(back["ssn"].asString() == "1234-5678" && back["notes"].at(1).asString() == "n2");
+    CHECK(back["bank.account"].asString() == "000111222" &&
+          back["cards"].at(0)["number"].asString() == "4242424242424242");
+    CHECK(M.find({{"token", "tok-123"}}).count() == 2);  // deterministic: equality works
+    CHECK(M.find("token in ['tok-123', 'x']").count() == 2);
+    CHECK_THROWS(M.find({{"ssn", "1234-5678"}}).count(), Error);                  // random: cannot be filtered
+    CHECK_THROWS(M.find({{"token", {{"$gt", "a"}}}}).count(), Error);             // only equality on encrypted fields
+    CHECK_THROWS(M.create({{"name", "short"}, {"ssn", "12"}}), ValidationError);  // validated on plain text
+
+    M.updateOne({{"_id", a._id()}}, {{"ssn", "9999-0000"}, {"$push", {{"notes", "n3"}}}});
+    auto rawAfter = rawRead({{"_id", a._id()}});
+    CHECK(rawAfter["ssn"].asString().rfind("nvenc:1:", 0) == 0 &&
+          rawAfter["notes"].at(2).asString().rfind("nvenc:1:", 0) == 0);
+    back = M.findById(a._id()).orFail();
+    CHECK(back["ssn"].asString() == "9999-0000" && back["notes"].size() == 3 && back["notes"].at(2).asString() == "n3");
+    back.set("bank.account", "555").save();
+    CHECK(rawRead({{"_id", a._id()}})["bank"]["account"].asString().rfind("nvenc:1:", 0) == 0);
+    CHECK(M.findById(a._id()).orFail()["bank.account"].asString() == "555");
+    auto agg = M.aggregate().match({{"token", "tok-123"}}).project("ssn token").exec();
+    CHECK(agg.size() == 2 && (agg[0]["ssn"].asString() == "9999-0000" || agg[0]["ssn"].asString() == "1234-5678"));
+    auto upd = M.findOneAndUpdate({{"_id", a._id()}}, {{"token", "tok-999"}}, {.returnNew = true});
+    CHECK(upd && (*upd)["token"].asString() == "tok-999" && M.find({{"token", "tok-999"}}).count() == 1);
+
+    // wrong key -> clear error (never garbage); hex key works
+    setEncryptionKey("a different key");
+    CHECK_THROWS(M.findById(a._id()).lean(), Error);
+    setEncryptionKey("correct horse battery staple");
+    CHECK(M.findById(a._id()).lean().value()["ssn"].asString() == "9999-0000");
+    // tampering is detected (GCM tag)
+    std::string ct = rawRead({{"_id", a._id()}})["ssn"].asString();
+    ct[ct.size() - 6] = ct[ct.size() - 6] == 'A' ? 'B' : 'A';
+    Raw.updateOne({{"_id", a._id()}}, {{"ssn", ct}});
+    CHECK_THROWS(M.findById(a._id()).lean(), Error);
+    setEncryptionKey(std::string(64, 'a'));  // 64 hex chars = raw key
+    M.create({{"name", "Hex"}, {"ssn", "hexkey-1"}});
+    CHECK(M.findOne({{"name", "Hex"}}).lean().value()["ssn"].asString() == "hexkey-1");
+    clearEncryptionKey();
+    M.dropCollection();
+}
+
 int main() {
     testValue();
     testSchemaOffline();
@@ -2029,6 +2253,10 @@ int main() {
     testBatchWriter();
     testFromQuery();
     testSchemaExport();
+    testSoftDelete();
+    testHistory();
+    testMultiTenant();
+    testEncryption();
     disconnect();
     CHECK(!connected());
 

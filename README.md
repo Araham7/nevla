@@ -5,6 +5,8 @@
 Schemas, validation, casting, defaults, middleware (hooks), populate, virtuals, discriminators, transactions,
 change streams and a chainable query builder — the API you know from Node.js
 [Mongoose](https://mongoosejs.com), on top of the official MongoDB C++ driver (`mongocxx`).
+Plus what Mongoose does not have: compile-time checked typed models, `co_await`, an in-memory database for
+tests, field encryption, multi-tenancy, migrations and more.
 
 > *nevla* (नेवला) is the Hindi word for *mongoose*.
 
@@ -66,13 +68,31 @@ Hindi/Hinglish guide: [docs/README.hinglish.md](docs/README.hinglish.md)
 24. [Transactions](#transactions)
 25. [Change streams](#change-streams)
 26. [Typed structs with `NEVLA_STRUCT`](#typed-structs-with-nevla_struct)
-27. [Errors](#errors)
-28. [Threads, async and debugging](#threads-async-and-debugging)
-29. [Schema options](#schema-options)
-30. [Mongoose → nevla cheat sheet](#mongoose--nevla-cheat-sheet)
-31. [Differences from Mongoose](#differences-from-mongoose)
-32. [Project layout, tests and examples](#project-layout-tests-and-examples)
-33. [Contributing, changelog, license](#contributing-changelog-license)
+
+**Extras that Mongoose does not have**
+
+27. [Typed models (member pointers)](#typed-models-member-pointers)
+28. [co_await and event loops](#co_await-and-event-loops) · [Using nevla with Drogon](#using-nevla-with-drogon) · [GCC 13 tip](#gcc-13-no--inside-a-co_await-expression)
+29. [In-memory database (`memory://`)](#in-memory-database-memory)
+30. [Typo protection: `strictQuery`](#typo-protection-strictquery) · [Slow query log](#slow-query-log)
+31. [Time-series collections](#time-series-collections)
+32. [Batch writer](#batch-writer)
+33. [REST query parameters: `fromQuery`](#rest-query-parameters-fromquery)
+34. [Schema export and the MongoDB validator](#schema-export-and-the-mongodb-validator)
+35. [Built-in plugins: soft delete, history, multi-tenant](#built-in-plugins-soft-delete-history-multi-tenant)
+36. [Field encryption](#field-encryption)
+37. [Migrations](#migrations)
+38. [findById cache](#findbyid-cache)
+
+**Reference**
+
+39. [Errors](#errors)
+40. [Threads, async and debugging](#threads-async-and-debugging)
+41. [Schema options](#schema-options)
+42. [Mongoose → nevla cheat sheet](#mongoose--nevla-cheat-sheet)
+43. [Differences from Mongoose](#differences-from-mongoose)
+44. [Project layout, tests and examples](#project-layout-tests-and-examples)
+45. [Contributing, changelog, license](#contributing-changelog-license)
 
 ---
 
@@ -96,9 +116,19 @@ nevla gives C++ the developer experience of Mongoose:
 | Middleware | `pre/post` hooks for `save`, `validate`, `find`, `updateOne`, `aggregate`, ... |
 | Real-world features | transactions, change streams, bulk writes, cursors, pagination, optimistic concurrency |
 | C++ comfort | `NEVLA_STRUCT` maps your structs to documents at compile time |
+| Typed models | `Devices.find().where(&Device::temp).gte(30)`: a typo is a compile error |
+| `co_await` | `co_await User.find(...).countAsync()` in `drogon::Task<>` or any coroutine; resumes on your IO loop |
+| Tests without a server | `connect("memory://test")`: a built-in, MongoDB-compatible engine |
+| Safety | `strictQuery` ("Did you mean `email`?"), `syncValidator()`, field encryption (AES-256-GCM) |
+| SaaS / IoT building blocks | multi-tenant, soft delete, history, migrations, time-series, batch writer, `fromQuery`, cache, slow log |
 
 It is **thread-safe**, uses a **connection pool**, and is tested against a real MongoDB server
-(including AddressSanitizer / UBSan runs).
+(1,658 checks, including 930 query results compared between MongoDB and the in-memory engine; clean under
+AddressSanitizer / UBSan and ThreadSanitizer).
+
+**Is it a new driver?** No. nevla is built on top of the official **mongocxx** driver, which does the wire
+protocol, connection pooling, TLS, authentication and replica-set handling. nevla adds the ODM layer above it.
+The only engine of its own is the optional in-memory database for tests (`memory://`).
 
 ---
 
@@ -107,7 +137,11 @@ It is **thread-safe**, uses a **connection pool**, and is tested against a real 
 - A C++20 compiler: **g++ 11+** or **clang 14+**
 - **CMake 3.16+**
 - **mongocxx 3.8+** (the MongoDB C++ driver; tested with 3.10.2)
-- A MongoDB server (4.4+; transactions and change streams need a replica set or Atlas)
+- **OpenSSL 1.1+ / 3** (`libssl-dev`; used for field encryption)
+- A MongoDB server (4.4+; transactions and change streams need a replica set or Atlas; time-series
+  collections need 5.0+; `bucketByTime` with `fillGaps` and `dateDiff` in formulas need 5.1+).
+  Not needed at all with `memory://`.
+- Optional: **Drogon** (only for `<nevla/drogon.hpp>` and example 08)
 
 ### 1. Install the MongoDB C++ driver (Ubuntu 22.04 / 24.04)
 
@@ -135,8 +169,10 @@ cd nevla
 cmake -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 
-# optional: run the tests (needs MongoDB on 127.0.0.1:27017)
+# optional: run the tests (needs MongoDB on 127.0.0.1:27017) ...
 ./build/nevla_tests
+# ... or without any server
+NEVLA_TEST_URI=memory://t ./build/nevla_tests
 # optional: install system-wide
 sudo cmake --install build
 ```
@@ -174,7 +210,7 @@ target_link_libraries(myapp PRIVATE nevla::nevla)
 
 ```cmake
 include(FetchContent)
-FetchContent_Declare(nevla GIT_REPOSITORY https://github.com/<your-username>/nevla.git GIT_TAG v0.4.0)
+FetchContent_Declare(nevla GIT_REPOSITORY https://github.com/<your-username>/nevla.git GIT_TAG v0.5.0)
 FetchContent_MakeAvailable(nevla)
 target_link_libraries(myapp PRIVATE nevla::nevla)
 ```
@@ -182,7 +218,7 @@ target_link_libraries(myapp PRIVATE nevla::nevla)
 **C. After `cmake --install`**
 
 ```cmake
-find_package(nevla 0.4 CONFIG REQUIRED)
+find_package(nevla 0.5 CONFIG REQUIRED)
 target_link_libraries(myapp PRIVATE nevla::nevla)
 ```
 
@@ -204,6 +240,7 @@ using namespace nevla;
 connect("mongodb://127.0.0.1:27017", "mydb");          // URI + database name
 connect("mongodb://127.0.0.1:27017/mydb");             // database from the URI
 connect("mongodb+srv://user:pass@cluster0.mongodb.net/mydb?retryWrites=true&w=majority");  // Atlas
+connect("memory://test");                               // built-in in-memory database (tests, demos)
 
 connected();          // bool
 databaseName();       // "mydb"
@@ -812,6 +849,11 @@ not a field (`'$5 off'`).
 
 An accumulator with a formula needs a name: `sum("price * qty").as("revenue")`.
 
+> **Changed in 0.4:** a string passed where a filter is expected is parsed as a formula. Before 0.4 it was
+> ignored, so `User.find("anything")` matched every document. Now `find("age >= 18")` is a real filter, and
+> a plain word is a field test: `find("active")` means `{active: true}`. Code that passed a stray string
+> now gets the filter it wrote, or a `FormulaError`. Turn on `strictQuery` to also catch misspelled fields.
+
 ---
 
 ## Distinct and counting
@@ -1103,6 +1145,406 @@ Write the macro outside the struct, in the same namespace. Add your own types wi
 
 ---
 
+## Typed models (member pointers)
+
+`NEVLA_STRUCT` maps a struct; `TypedModel<T>` turns it into a model whose queries use **member pointers**, so
+a typo or a wrong type is a **compile error**, not a silent empty result.
+
+```cpp
+#include <nevla/nevla.hpp>
+
+struct Device {
+    std::string id, name, room;          // "id" <-> "_id"
+    double temp = 0;
+    bool online = false;
+    std::vector<std::string> tags;
+    std::optional<std::string> note;     // missing / null <-> std::nullopt
+};
+NEVLA_STRUCT(Device, id, name, room, temp, online, tags, note)
+
+TypedModel<Device> Devices("Device");                   // schema generated from the struct
+
+Device d = Devices.create({.name = "temp-1", .room = "lab", .temp = 24.5});
+std::vector<Device> hot = Devices.find()
+    .where(&Device::temp).gte(30).lt(60)                // chain conditions on one field
+    .where(&Device::room).in({"lab", "hall"})
+    .sort(&Device::temp, -1).limit(10).exec();
+std::optional<Device> one = Devices.findById(d.id);
+int64_t n = Devices.find().where(&Device::online).equals(true).count();
+Devices.update(d.id).set(&Device::temp, 26.0).push(&Device::tags, "calibrated").exec();
+Devices.deleteById(d.id);
+```
+
+| Mistake | Result |
+|---|---|
+| `.where(&Device::tmep)` | compile error: no member `tmep` |
+| `.where(&Device::temp).gte("hot")` | compile error: `temp` is a `double` |
+| `.update(id).inc(&Device::name, 1)` | compile error: `$inc` on a string |
+
+Want validation rules too? Start from the generated schema and add to it:
+
+```cpp
+Schema s = schemaOf<Device>({.timestamps = true});
+s.add("name", String().required().trim());
+s.add("room", String().enumOf({"lab", "hall", "roof"}));
+TypedModel<Device> Devices("Device", s);
+Devices.model();    // the untyped Model, for everything else (aggregate, fromQuery, plugins' statics ...)
+```
+
+Conditions: `equals ne gt gte lt lte in nin exists contains regex`; nested members:
+`where(&User::address, &Address::city)`; anything else: `where("formula string")` or `where(Value)`.
+
+---
+
+## co_await and event loops
+
+Every operation has an `...Async()` form that returns `nevla::Async<T>`. The database work runs on nevla's
+thread pool; the coroutine continues when the result is there, so an event-loop thread is **never blocked**.
+
+```cpp
+Task<int64_t> dashboard(Model Users) {
+    auto adults = co_await Users.find("age >= 18").countAsync();
+    auto rows   = co_await Users.find("role == 'admin'").sort("-createdAt").limit(5).leanAsync();
+    auto doc    = co_await Users.createAsync(body);          // ValidationError is thrown here, as usual
+    co_await Users.updateOneAsync(filter, update);
+    co_return adults;
+}
+int64_t n = dashboard(User).get();       // outside any coroutine: run it and wait
+```
+
+Available: `exec/lean/countAsync` on queries, `findOne(...).execAsync/leanAsync`, `aggregate().execAsync`,
+`createAsync`, `insertManyAsync`, `updateOne/ManyAsync`, `deleteOne/ManyAsync`, `countDocumentsAsync`,
+`doc.saveAsync()`, typed `execAsync()`, and `asyncCall([&] { ... })` for any blocking code.
+
+- **Any coroutine type** can `co_await` them: `drogon::Task<>`, Boost.Asio / cppcoro awaitables, or
+  `nevla::Task<T>` (a small task type for code that has none). No adapter needed.
+- `TenantScope` / `ActorScope` (see plugins) travel with the operation onto the pool thread.
+- A `transaction()` does not span `co_await`s: a transaction belongs to one thread.
+- Pool size: `setAsyncThreads(n)` before the first async call (default: `max(4, cores)`).
+
+### Where does the coroutine continue? (event-loop servers)
+
+By default, after a `co_await` the coroutine continues on the **nevla pool thread** that did the work. In an
+event-loop server (Drogon, Asio) the rest of your handler must run on **its own IO loop**. Tell nevla how to get
+back there, once, at startup:
+
+```cpp
+nevla::setResumeOn([]() -> nevla::Resumer {        // called on the thread that does the co_await
+    auto *loop = trantor::EventLoop::getEventLoopOfCurrentThread();
+    if (!loop) return {};                           // not a loop thread: continue on the pool (default)
+    return [loop](std::function<void()> resume) { loop->queueInLoop(std::move(resume)); };
+});
+```
+
+### Using nevla with Drogon
+
+`<nevla/drogon.hpp>` (header-only, only include it in a Drogon app) does the above for you:
+
+```cpp
+#include <drogon/drogon.h>
+#include <nevla/drogon.hpp>
+#include <nevla/nevla.hpp>
+using namespace drogon;
+
+Task<HttpResponsePtr> createUser(HttpRequestPtr req) {
+    try {
+        auto body = nevla::Value::parse(std::string(req->body()));
+        auto doc = co_await nevla::model("User").createAsync(body);   // I/O on the nevla pool ...
+        auto r = HttpResponse::newHttpResponse();                     // ... and we are back on this IO loop
+        r->setStatusCode(k201Created);
+        r->setContentTypeCode(CT_APPLICATION_JSON);
+        r->setBody(doc.toJSON().toJson());
+        co_return r;
+    } catch (const nevla::ValidationError &e) {
+        auto r = HttpResponse::newHttpResponse();
+        r->setStatusCode(k400BadRequest);
+        r->setContentTypeCode(CT_APPLICATION_JSON);
+        r->setBody(nevla::obj("errors", e.toJSON()).toJson());   // {"errors": {"name": "Path `name` is required."}}
+        co_return r;
+    }
+}
+
+int main() {
+    nevla::useDrogonLoop();                                      // co_await returns to the same IO loop
+    const char *uri = std::getenv("MONGODB_URI");
+    nevla::connect(uri ? uri : "mongodb://127.0.0.1:27017", "iot");
+    nevla::model("User", nevla::Schema({{"name", nevla::String().required()}}));
+    app().registerHandler("/users", &createUser, {Post});
+    app().addListener("0.0.0.0", 8080).setThreadNum(4).run();
+}
+```
+
+`examples/08_drogon.cc` is a complete app; it is built when Drogon is installed, and `08_drogon --check`
+(also a CTest test) fires 400 concurrent requests and verifies that every handler resumed on its own IO loop.
+Without `useDrogonLoop()` the same check finds 400+ handlers on the wrong thread.
+
+### GCC 13: no `{{...}}` inside a `co_await` expression
+
+GCC 13 has an internal compiler error (*"in build_special_member_call"*) when a braced list such as
+`{{"name", "x"}}` appears inside a `co_await` expression. Wrapping it in a function (`doc({...})`) does not
+help; the braced list itself triggers it. Two fixes:
+
+```cpp
+// 1. obj() / arr(): the same Value, built without braces
+auto u = co_await User.createAsync(nevla::obj("name", "Asha", "age", 21));
+auto n = co_await User.find(nevla::obj("age", nevla::obj("$gte", 18))).countAsync();
+auto t = co_await Post.find(nevla::obj("tags", nevla::obj("$in", nevla::arr("cpp", "iot")))).leanAsync();
+
+// 2. a formula string, or a Value built on the line before
+auto m = co_await User.find("age >= 18").countAsync();
+Value filter{{"age", {{"$gte", 18}}}};
+auto k = co_await User.find(filter).countAsync();
+```
+
+GCC 14+, Clang and MSVC accept braces everywhere.
+
+---
+
+## In-memory database (`memory://`)
+
+```cpp
+connect("memory://test");     // no MongoDB server: the database lives inside your process
+```
+
+The same nevla code runs on a built-in, MongoDB-compatible engine: CRUD, every query operator nevla uses,
+updates (incl. positional `$`, `$push` with `$each/$sort/$slice`, `$addToSet`, upserts), unique indexes,
+`$jsonSchema` validators, aggregation (`$match $group $sort $project $addFields $lookup $unwind $facet`
+`$count $sample $replaceRoot $dateTrunc $densify` and the usual expression operators), populate, transactions (snapshot + rollback), plugins,
+migrations, the batch writer and `co_await`.
+
+- **Use it for unit tests and demos.** Your test suite needs no MongoDB, no Docker, no download.
+  nevla's own suite runs on it: `NEVLA_TEST_URI=memory://t ./build/nevla_tests`.
+- It is checked against real MongoDB: the test suite runs 930 random queries, updates and pipelines on both
+  and compares the results.
+- Not supported (a clear `nevla::Error`, never a wrong answer): change streams (`watch()`), collation,
+  `$where`, `$text`, geo queries, `$lookup` with `let`, `$bucket`, `$setWindowFields`, and named time zones
+  other than fixed offsets (`Asia/Kolkata` and `+05:30` work). `explain()`/`plan()` report `"MEMORY"`.
+- One global lock per database: correct under any number of threads, but not a production database.
+  Many concurrent readers that scan large collections slow writers down.
+- Data is gone when the process exits. Every `connect("memory://name")` with the same name in one process
+  shares the data.
+
+---
+
+## Typo protection: `strictQuery`
+
+Mongoose silently ignores a filter path that is not in the schema, so `{emial: x}` matches nothing (or
+everything) without a word. nevla can refuse it:
+
+```cpp
+Schema s({...}, {.strictQuery = true});      // this model
+nevla::setStrictQuery(true);                 // or every model
+
+User.find({{"emial", "a@x.in"}}).exec();
+// nevla::Error: unknown path "emial" in a filter on model "User" (strictQuery). Did you mean "email"?
+```
+
+Operators, `_id`, the version key, timestamps, aliases, the discriminator key and paths inside `Mixed`
+fields are always allowed.
+
+---
+
+## Slow query log
+
+```cpp
+nevla::setSlowQueryThreshold(100, [](const nevla::SlowQuery &q) {
+    std::cerr << q.collection << "." << q.op << " took " << q.ms << " ms " << q.args.toJson()
+              << " -> " << q.suggestion << "\n";
+});
+// readings.find took 412 ms {"device":"d1","at":{"$gte":...}} -> consider an index {device: 1, at: 1}
+nevla::setSlowQueryThreshold(0);    // off
+```
+
+Without a callback it prints to stderr. The suggestion follows the ESR rule (equality fields, then sort,
+then range) and is only a hint: check it with `aggregate().plan()` / `explain()`.
+
+---
+
+## Time-series collections
+
+For sensor readings, metrics and logs (MongoDB 5.0+). Declare it in the schema; the collection is created as a
+time-series collection on first use:
+
+```cpp
+Schema readingSchema({
+    {"device", String().required()},
+    {"value",  Number().required()},
+    {"at",     DateTime().required()},
+}, {.timeseries = {.timeField = "at", .metaField = "device", .granularity = "seconds",
+                   .expireAfterSeconds = 90 * 86400}});          // keep 90 days
+auto Reading = model("Reading", readingSchema);
+
+Reading.create({{"device", "d1"}, {"value", 24.5}, {"at", Date::now()}});
+Reading.aggregate().match("device == 'd1'").bucketByTime("at", "15m", {avg("value")}).exec();
+Reading.collectionInfo()["type"];                                 // "timeseries"
+```
+
+`model()` checks the options (time field must be a `DateTime`, granularity must be valid, ...).
+If the collection already exists as a normal collection, nevla does not convert it.
+
+---
+
+## Batch writer
+
+Thousands of small inserts per second (MQTT telemetry, logs) are slow one by one. The batch writer queues
+them and writes them with `insertMany` in the background:
+
+```cpp
+auto writer = Reading.batchWriter({.maxDocs = 500, .maxDelayMs = 200});
+writer.onError([](const std::string &msg, int64_t lost) { std::cerr << lost << " lost: " << msg << "\n"; });
+
+writer.add({{"device", id}, {"value", 30.5}, {"at", Date::now()}});  // validated NOW (throws ValidationError)
+...
+writer.flush();                       // wait until everything queued is written
+writer.stats();                       // {queued, written, failed, batches}
+```
+
+- A batch is written when `maxDocs` are queued or the oldest one has waited `maxDelayMs`.
+- `add()` blocks when `maxQueue` documents are waiting (backpressure, no unbounded memory).
+- `ordered = false` (default): one bad document (e.g. duplicate key) does not stop the rest.
+- Casting, defaults and validation run in `add()`, in your thread. Copies share one writer; the last copy
+  flushes and stops it.
+
+---
+
+## REST query parameters: `fromQuery`
+
+Turn `GET /users?age[gte]=18&city[in]=Kolkata,Durgapur&sort=-createdAt&page=2&limit=20&fields=name,email`
+into a safe, schema-cast query with pagination:
+
+```cpp
+auto params = nevla::parseQueryString(req->query());     // URL-decoded map
+Page page = User.fromQuery(params, {
+    .allow       = {"age", "role", "city", "createdAt"},   // filterable (and sortable / selectable)
+    .defaultSort = "-createdAt",
+});
+return page.toJSON();     // {docs, total, page, perPage, pages, hasNext, hasPrev}
+```
+
+| Parameter | Means |
+|---|---|
+| `field=v` | equality (cast with the schema: `"18"` → `18`, `"2026-11-01"` → `Date`) |
+| `field[eq\|ne\|gt\|gte\|lt\|lte]=v` | comparison |
+| `field[in\|nin]=a,b,c` | in a list |
+| `field[exists]=true\|false` | field present |
+| `field[contains]=txt` / `field[startsWith]=txt` | case-insensitive text match (regex characters escaped) |
+| `field[regex]=...` | only with `.allowRegex = true` (a user regex can be very slow) |
+| `sort=-age,name` `page=2` `limit=20` `fields=name,email` | sort, page, page size (≤ `maxLimit`), projection |
+
+Anything not allowed (unknown field or operator, sorting / selecting a field that is not allowed, a value that
+cannot be cast, `page=0`) throws `QueryParamError` with `.param`, so you can answer 400. A `limit` above
+`maxLimit` is lowered to `maxLimit`. Hidden fields (`select(false)`) stay hidden.
+
+---
+
+## Schema export and the MongoDB validator
+
+One schema, many consumers:
+
+```cpp
+userSchema.toJsonSchema();        // JSON Schema as a Value (the same one syncValidator() stores)
+userSchema.toOpenAPI();           // OpenAPI 3 component schema (for Swagger)
+userSchema.toTypeScript("User");  // "export interface User { _id: string; name: string; age?: number; ... }"
+
+User.syncValidator();             // store the schema as MongoDB's own $jsonSchema validator
+nevla::syncValidators();          // every model (e.g. in a "db:sync" deploy step)
+```
+
+With the validator stored, even other programs (mongosh, a Python script) cannot insert a document that
+breaks the types / required / enum / min / max rules. `syncValidator("moderate")` leaves existing invalid
+documents updatable; `action = "warn"` only logs. Time-series models and discriminator children are skipped
+by `syncValidators()` (a child shares its base model's collection; call it on the base).
+
+---
+
+## Built-in plugins: soft delete, history, multi-tenant
+
+```cpp
+schema.plugin(nevla::plugins::softDelete);     // {{"field", "deletedAt"}}
+schema.plugin(nevla::plugins::history);        // {{"collection", "nevla_history"}}
+schema.plugin(nevla::plugins::multiTenant);    // {{"field", "tenantId"}}
+```
+
+**Soft delete.** `doc.call("softDelete")`, `doc.call("restore")`, `doc.call("isDeleted")`,
+`User.call("softDelete", filter)`. Every `find`, `count`, `update`, `aggregate` hides deleted documents;
+`{{"$withDeleted", true}}` in a filter shows them.
+
+**History (audit log).** Every create / save / delete, and every `updateOne/Many` through the model, writes an
+entry `{model, docId, op, changes, by, at}` to `nevla_history`. `changes` holds the new value of each modified
+path (`null` = removed); `updateOne/Many` entries keep the filter and update instead. Encrypted fields are
+masked.
+
+```cpp
+nevla::ActorScope who("asha@x.in");            // who is doing it (this request / thread)
+User.call("history", id);                      // [{op: "update", changes: {age: 22}, by: "asha@x.in", at: ...}, ...]
+```
+
+**Multi-tenant.** Every query, insert, update and aggregate of the thread is scoped to the tenant:
+
+```cpp
+nevla::TenantScope t(req->getHeader("X-Tenant"));   // e.g. in an auth middleware
+User.find().exec();                                 // only this tenant's users; inserts get tenantId
+{ nevla::AllTenantsScope admin; User.countDocuments(); }   // maintenance code: everything
+```
+
+No tenant set → `nevla::Error`. A forgotten scope never turns into a silent cross-tenant query.
+The tenant field is required, indexed and immutable.
+
+---
+
+## Field encryption
+
+```cpp
+nevla::setEncryptionKey(std::getenv("NEVLA_KEY"));   // 64 hex characters (32 bytes), or a passphrase
+
+Schema s({
+    {"aadhaar", String().encrypted()},       // random IV: strongest, cannot be searched
+    {"token",   String().encrypted(true)},   // deterministic: equality filters still work
+});
+User.create({{"aadhaar", "1234 5678 9012"}, {"token", "tok-42"}});
+User.findOne({{"token", "tok-42"}});         // works (deterministic)
+```
+
+- AES-256-GCM (OpenSSL); stored as the string `"nvenc:1:<base64>"`. Reads decrypt automatically.
+- Deterministic fields support equality and `$in` only; a range filter on an encrypted field throws.
+- Without the key, reading an encrypted field throws: nothing is ever returned as garbage.
+- Keep the key outside the database (environment, secret manager). Lose it and the data is gone.
+
+---
+
+## Migrations
+
+```cpp
+nevla::migration("2026-11-20-add-plan",
+    [] { User.updateMany(Value::object(), {{"plan", "free"}}); },          // up
+    [] { User.updateMany(Value::object(), {{"$unset", {{"plan", ""}}}}); });  // down (optional)
+
+nevla::migrate();            // runs the ones not run yet, in id order -> {"2026-11-20-add-plan"}
+nevla::rollback();           // undoes the last one
+nevla::migrationStatus();    // [{id, applied, at, ms}, ...]
+```
+
+- Applied ids are recorded in `nevla_migrations`; running `migrate()` again does nothing.
+- A lock document stops two servers that start at the same time from running a migration twice.
+- `{.transaction = true}` runs each one in a transaction (replica set).
+- Ids sort as text: start them with a date.
+
+---
+
+## findById cache
+
+```cpp
+User.cache({.ttlMs = 30000, .maxEntries = 10000});
+User.findById(id).exec();      // served from memory after the first read
+User.cacheStats();             // {hits, misses, size}
+```
+
+Every write through nevla (save, update, delete, bulkWrite) clears the cached entries of that model. The
+TTL is for other processes that may change the data. The cache is skipped inside transactions and for
+models with `findOne` middleware (softDelete / multiTenant / your own hooks), because those must always run.
+
+---
+
 ## Errors
 
 All errors derive from `nevla::Error` (a `std::runtime_error`).
@@ -1115,12 +1557,14 @@ All errors derive from `nevla::Error` (a `std::runtime_error`).
 | `NotFoundError` | `orFail()` found nothing; `save()` on a document that no longer exists |
 | `VersionError` | `optimisticConcurrency` conflict on `save()` |
 | `FormulaError` | a formula string has a mistake; `.column` (1-based) |
+| `QueryParamError` | `fromQuery()` got a parameter that is not allowed or cannot be cast; `.param` |
 | `Error` | everything else: not connected, bad JSON, server errors |
 
 ```cpp
 try {
     User.create(body);
-} catch (const ValidationError &e) {      // 400
+} catch (const ValidationError &e) {      // 400, body: e.toJSON() -> {"email": "Path `email` is required."}
+} catch (const QueryParamError &e) {      // 400
 } catch (const CastError &e) {            // 400
 } catch (const DuplicateKeyError &e) {    // 409
 } catch (const NotFoundError &e) {        // 404
@@ -1135,14 +1579,16 @@ try {
 
 - `Model` objects and the connection are **thread-safe**; use them from any number of threads.
 - A single `Document` object must not be modified by two threads at the same time.
-- All calls are blocking. Offload them with `nevla::async`:
+- The normal calls are blocking. In coroutines use the `...Async()` forms and `co_await` them
+  (see [co_await and event loops](#co_await-and-event-loops)); otherwise offload with `nevla::async`:
 
   ```cpp
   auto fut = nevla::async([&] { return User.find({{"active", true}}).lean(); });
   auto users = fut.get();
   ```
 
-  In event-loop servers (Drogon, Boost.Asio, ...) run database calls on a worker pool, not on the loop thread.
+  In event-loop servers (Drogon, Boost.Asio, ...) never call the blocking forms on the loop thread.
+- Slow queries: `setSlowQueryThreshold(ms, fn)` (see [Slow query log](#slow-query-log)).
 
 - Debug logging, like `mongoose.set('debug', true)`:
 
@@ -1169,6 +1615,8 @@ Schema s({...}, {
     .updatedAt             = "updatedAt",
     .optimisticConcurrency = false,        // VersionError on conflicting save()
     .getters               = false,        // toJSON() applies field getters
+    .strictQuery           = false,        // unknown filter path -> Error ("Did you mean ...?")
+    .timeseries            = {},           // {.timeField, .metaField, .granularity, .expireAfterSeconds}
 });
 ```
 
@@ -1211,6 +1659,14 @@ C++ designated initializers must keep this order; write only the ones you need:
 | `Query.cursor()` | `Query.cursor()` |
 | `mongoose.startSession()` + `withTransaction` | `transaction([&] {...})` |
 | `mongoose.set('debug', true)` | `setDebug(true)` |
+| `mongoose.set('strictQuery', true)` (silently drops the path) | `setStrictQuery(true)` (throws, suggests the right name) |
+| `await User.find(...)` in an `async` function | `co_await User.find(...).execAsync()` in a coroutine |
+| `mongodb-memory-server` (downloads a mongod) | `connect("memory://test")` |
+| `mongoose-delete`, `mongoose-history`, tenant plugins | `plugins::softDelete`, `plugins::history`, `plugins::multiTenant` |
+| `mongoose-encryption` / CSFLE setup | `String().encrypted()` + `setEncryptionKey(...)` |
+| `migrate-mongo` | `migration(id, up, down)` + `migrate()` |
+| `mongoose-to-swagger`, `ts-mongoose` | `schema.toOpenAPI()`, `schema.toTypeScript("User")` |
+| hand-written `req.query` parsing | `Model.fromQuery(params, {.allow = {...}})` |
 
 ---
 
@@ -1219,7 +1675,7 @@ C++ designated initializers must keep this order; write only the ones you need:
 C++ syntax:
 
 - No property access (`doc.name`): use `doc["name"]` / `doc.get("name")` and `doc.set("name", v)`.
-- No `await`: every call is blocking; use `nevla::async` or your own thread pool.
+- No `await`: calls are blocking; in a coroutine use `co_await ...Async()`.
 - `virtual_`, `static_`, `or_`, `and_` because of C++ keywords.
 
 Behaviour:
@@ -1228,7 +1684,7 @@ Behaviour:
 - Query `countDocuments()` ignores `skip`/`limit`.
 - One connection (one database) at a time; use the database's `$lookup`/`aggregate` for cross-db work.
 - Not implemented yet: `Decimal128`, `Buffer`/binary, `BigInt` types; `populate` across databases;
-  callback / coroutine async API; `Query.explain()`; `Model.translateAliases()`.
+  `Model.translateAliases()`.
 
 ---
 
@@ -1242,31 +1698,44 @@ nevla/
 │   ├── schema.hpp       # Schema, Field, errors
 │   ├── model.hpp        # connect, Model, Document, Query, Cursor, ChangeStream, Aggregate
 │   ├── formula.hpp      # expr(), formulaFilter(), FormulaError
-│   └── typed.hpp        # NEVLA_STRUCT
-├── src/                 # value.cc, schema.cc, model.cc, formula.cc
+│   ├── typed.hpp        # NEVLA_STRUCT
+│   ├── typed_model.hpp  # TypedModel<T>, schemaOf<T>()
+│   ├── async.hpp        # Async<T>, Task<T>, setResumeOn()
+│   ├── plugins.hpp      # softDelete, history, multiTenant, TenantScope, setEncryptionKey
+│   └── drogon.hpp       # useDrogonLoop() (optional, header-only)
+├── src/                 # value, schema, model, formula, async, plugins, crypto, memory (.cc)
 ├── examples/
 │   ├── 01_quickstart.cc     # CRUD
 │   ├── 02_blog.cc           # populate, hooks, virtuals, methods
 │   ├── 03_iot.cc            # custom _id, discriminators, TTL, aggregate, transaction
 │   ├── 04_typed_struct.cc   # NEVLA_STRUCT
 │   ├── 05_features.cc       # statics, plugins, Map, getters, virtual populate, paginate, cursor, bulkWrite
-│   └── 06_iot_dashboard.cc  # end-to-end: 8 writers + 5 live dashboards, every number verified
-├── tests/test.cc        # 471 checks against a real MongoDB
+│   ├── 06_iot_dashboard.cc  # end-to-end: 8 writers + 5 live dashboards, every number verified
+│   ├── 07_offline_api.cc    # v0.5 tour on memory:// (typed model, plugins, encryption, migrations, ...)
+│   └── 08_drogon.cc         # Drogon app with co_await (built when Drogon is installed)
+├── tests/
+│   ├── test.cc          # 1,658 checks on MongoDB / 708 on memory://
+│   └── compile_fail/    # typed-model mistakes that must NOT compile
 ├── docs/README.hinglish.md
 ├── .github/workflows/ci.yml
 ├── CHANGELOG.md  CONTRIBUTING.md  LICENSE  CMakeLists.txt
 ```
 
 ```bash
-./build/nevla_tests                                         # "471 passed, 0 failed"
+./build/nevla_tests                                         # "1658 passed, 0 failed"
+NEVLA_TEST_URI=memory://t ./build/nevla_tests               # "708 passed, 0 failed" (no server)
 NEVLA_TEST_URI="mongodb://host:27017/?replicaSet=rs0" ./build/nevla_tests
-cd build && ctest
+cd build && ctest       # both suites, 4 compile-fail checks, the Drogon resume check (7 tests)
+./build/07_offline_api                # runs anywhere
+./build/08_drogon --check             # 400 concurrent HTTP requests, every co_await back on its IO loop
 ./build/05_features
 ./build/06_iot_dashboard 12500        # 100,000 readings from 8 threads, checks every aggregate
 ```
 
-Tested on Ubuntu 24.04, g++ 13, mongocxx 3.10.2, MongoDB 8 (single-node replica set), also under
-AddressSanitizer + UndefinedBehaviorSanitizer.
+Tested on Ubuntu 24.04, g++ 13, mongocxx 3.10.2, MongoDB 8 (single-node replica set), Drogon 1.9, also
+under AddressSanitizer + UndefinedBehaviorSanitizer and ThreadSanitizer. The MongoDB suite includes a
+differential test: 930 random queries / updates / pipelines run on MongoDB and on `memory://`, and the results
+must be identical.
 
 ---
 

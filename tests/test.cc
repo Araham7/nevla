@@ -1227,11 +1227,249 @@ static void testAggregateBuilderDb() {
     Reading.dropCollection();
 }
 
+/* ============================ v0.4: formulas, buckets, shortcuts, pipeline populate ============================ */
+static void testFormulasOffline() {
+    section("formula strings (no DB)");
+    CHECK(expr("price * qty * (1 - discount)").toJson() ==
+          R"({"$multiply":["$price","$qty",{"$subtract":[1,"$discount"]}]})");
+    CHECK(expr("if(temp > 30, 'hot', 'ok')").toJson() == R"({"$cond":[{"$gt":["$temp",30]},"hot","ok"]})");
+    CHECK(expr("round(avg(readings), 2)").toJson() == R"({"$round":[{"$avg":"$readings"},2]})");
+    CHECK(expr("year(at, 'Asia/Kolkata')")["$year"]["timezone"].asString() == "Asia/Kolkata");
+    CHECK(expr("'$5 off'")["$literal"].asString() == "$5 off");
+    CHECK(expr("a % 3 == 0 and not b")["$and"].size() == 2);
+    CHECK(expr("-x")["$multiply"].at(0).asInt() == -1);
+    CHECK(expr("-2.5").asDouble() == -2.5);
+    CHECK(expr("now()").asString() == "$$NOW");
+    CHECK(expr("date('2026-11-17')").isDate());
+    CHECK(expr("x in [1, 2]")["$in"].at(1).size() == 2);
+
+    CHECK(formulaFilter("temp > 30 && room == 'lab'").toJson() == R"({"temp":{"$gt":30},"room":"lab"})");
+    CHECK(formulaFilter("age >= 18 && age < 60").toJson() == R"({"age":{"$gte":18,"$lt":60}})");
+    CHECK(formulaFilter("18 <= age").toJson() == R"({"age":{"$gte":18}})");  // constant on the left
+    CHECK(formulaFilter("used > limit").toJson() == R"({"$expr":{"$gt":["$used","$limit"]}})");
+    CHECK(formulaFilter("active && !deleted").toJson() == R"({"active":true,"deleted":{"$ne":true}})");
+    CHECK(formulaFilter("role in ['a', 'b'] || score >= 9.5")["$or"].size() == 2);
+    CHECK(formulaFilter("role not in ['x']")["role"]["$nin"].size() == 1);
+    CHECK(formulaFilter("x = 5").toJson() == R"({"x":5})");  // single '=' means equality
+    CHECK(formulaFilter("exists(device)")["device"]["$exists"].asBool());
+    CHECK(formulaFilter("a > 1 && a > 2").contains("$and"));
+    CHECK(formulaFilter("a > b && c > d")["$and"].size() == 2);  // two $expr parts are not merged into one
+    CHECK(formulaFilter("!(c == 3)")["$nor"].size() == 1);
+
+    // helpful errors with the column
+    auto errAt = [](const char *f) -> size_t {
+        try {
+            expr(f);
+        } catch (const FormulaError &e) {
+            return e.column;
+        }
+        return 0;
+    };
+    CHECK(errAt("price * * qty") == 9);
+    CHECK(errAt("price @ 2") == 7);
+    CHECK(errAt("foo(1)") == 1);
+    CHECK(errAt("'abc") == 1);
+    CHECK(errAt("a < b < c") == 7);
+    CHECK(errAt("round()") == 1);
+    CHECK(errAt("") == 1);
+    CHECK(errAt("max(") == 5);
+    CHECK(errAt("date('2026-02-30')") == 6);
+    CHECK(errAt("1x") == 2);
+    CHECK(errAt("(a + b") == 7);
+    try {
+        expr("foo(1)");
+    } catch (const FormulaError &e) {
+        CHECK(std::string(e.what()).find("Available: abs") != std::string::npos);
+    }
+
+    // formulas in the builder and in find()
+    auto Shop = model("FormulaShop",
+                      Schema({{"price", Number()}, {"qty", Int()}, {"at", DateTime()}, {"tag", String().alias("t")}}));
+    Value p = Shop.aggregate()
+                  .match("qty > '2' && at >= '2026-11-17'")  // cast: '2' -> 2, date text -> Date
+                  .addField("total", "price * qty")
+                  .group("", {sum("price * qty").as("revenue"), avg("total")})
+                  .pipeline();
+    CHECK(p.at(0)["$match"]["qty"]["$gt"].isInt() && p.at(0)["$match"]["at"]["$gte"].isDate());
+    CHECK(p.at(1)["$addFields"]["total"]["$multiply"].size() == 2);
+    CHECK(p.at(2)["$group"]["revenue"]["$sum"]["$multiply"].size() == 2);
+    CHECK_THROWS(Shop.aggregate().group("", {sum("price * qty")}), Error);  // a formula needs .as()
+    CHECK(Shop.find("qty >= 2 && t == 'x'").filter()["qty"]["$gte"].asInt() == 2);
+    CHECK_THROWS(Shop.find("qty >>> 2"), FormulaError);
+
+    // bucketByTime / populate / toShell shapes
+    Value b = Shop.aggregate()
+                  .bucketByTime("at", "15m", {avg("price")}, {.by = "tag", .timezone = "Asia/Kolkata"})
+                  .pipeline();
+    const Value &trunc = b.at(0)["$group"]["_id"]["time"]["$dateTrunc"];
+    CHECK(trunc["unit"].asString() == "minute" && trunc["binSize"].asInt() == 15 &&
+          trunc["timezone"].asString() == "Asia/Kolkata");
+    CHECK(b.at(0)["$group"]["_id"]["tag"].asString() == "$tag");
+    CHECK(b.at(b.size() - 1)["$sort"]["time"].asInt() == 1);
+    CHECK(Shop.aggregate()
+              .bucketByTime("at", "1M")
+              .pipeline()
+              .at(0)["$group"]["_id"]["time"]["$dateTrunc"]["unit"]
+              .asString() == "month");
+    CHECK(Shop.aggregate()
+              .bucketByTime("at", "2 hours")
+              .pipeline()
+              .at(0)["$group"]["_id"]["time"]["$dateTrunc"]["binSize"]
+              .asInt() == 2);
+    CHECK(Shop.aggregate().bucketByTime("at", "1h").pipeline().at(0)["$group"].contains("count"));  // default: count
+    CHECK_THROWS(Shop.aggregate().bucketByTime("at", "5 parsecs"), Error);
+    CHECK_THROWS(Shop.aggregate().bucketByTime("at", "0m"), Error);
+    CHECK_THROWS(Shop.aggregate().bucketByTime("at", "1h", {}, {.by = "time"}), Error);
+    CHECK_THROWS(Shop.aggregate().group("tag", {count()}).populate("x"), Error);  // populate after group
+    CHECK_THROWS(Shop.aggregate().populate("price"), Error);                      // not a ref
+    std::string sh = Shop.aggregate().match({{"at", "2026-11-17"}, {"_id", "6afdd514ff181d6c4f026fe2"}}).toShell();
+    CHECK(sh.find("db.getCollection(\"formulashops\").aggregate([") == 0);
+    CHECK(sh.find("ISODate(\"2026-11-17T00:00:00.000Z\")") != std::string::npos);
+    CHECK(sh.find("ObjectId(\"6afdd514ff181d6c4f026fe2\")") != std::string::npos);
+}
+
+static void testV04Db() {
+    section("formulas, bucketByTime, shortcuts, pipeline populate, explain (real data)");
+    auto Company = model("V4Company", Schema({{"name", String()}}));
+    Schema authorSchema({{"name", String()}, {"company", Id().ref("V4Company")}, {"pw", String().select(false)}});
+    authorSchema.virtualPopulate("posts", {.ref = "V4Post", .localField = "_id", .foreignField = "author"});
+    authorSchema.virtualPopulate("firstPost",
+                                 {.ref = "V4Post", .localField = "_id", .foreignField = "author", .justOne = true});
+    auto Author = model("V4Author", authorSchema);
+    auto Tag = model("V4Tag", Schema({{"label", String()}}));
+    Schema postSchema({{"title", String()},
+                       {"author", Id().ref("V4Author")},
+                       {"tags", Array(Id().ref("V4Tag"))},
+                       {"price", Number()},
+                       {"qty", Int()},
+                       {"at", DateTime()}},
+                      {.versionKey = ""});
+    postSchema.index({{"qty", 1}});
+    auto Post = model("V4Post", postSchema);
+    for (auto M : {Company, Author, Tag, Post}) M.dropCollection();
+
+    auto acme = Company.create({{"name", "Acme"}});
+    auto ana = Author.create({{"name", "Ana"}, {"company", acme._id()}, {"pw", "secret"}});
+    auto bo = Author.create({{"name", "Bo"}});
+    auto cy = Author.create({{"name", "Cy"}});  // no posts
+    auto tz = Tag.create({{"label", "z"}}), ta = Tag.create({{"label", "a"}});
+    // 10:05, 10:12, 10:50 (gap at 10:15 and 10:30), 11:20 ...
+    const char *times[] = {"2026-11-18T10:05:00Z", "2026-11-18T10:12:00Z", "2026-11-18T10:50:00Z",
+                           "2026-11-18T11:20:00Z", "2026-11-18T19:00:00Z", "2026-11-19T02:00:00Z"};
+    for (int i = 0; i < 6; i++)
+        Post.create({{"title", "P" + std::to_string(i)},
+                     {"author", i < 4 ? ana._id() : bo._id()},
+                     {"tags", Value::array({tz._id(), ObjectId::generate(), ta._id()})},  // middle id does not exist
+                     {"price", 10 + i},
+                     {"qty", i},
+                     {"at", times[i]}});
+
+    // formulas in queries and writes
+    CHECK(Post.find("qty >= 2 && price < 14").count() == 2);
+    CHECK(Post.countDocuments("title == 'P1' || qty == 5") == 2);
+    CHECK(Post.find("price > qty * 3").count() == 5);  // field vs field -> $expr (P5: 15 > 15 is false)
+    CHECK(Post.findOne("qty == 3").lean().value()["title"].asString() == "P3");
+    CHECK(Post.exists("title == 'P0'") && !Post.exists("title == 'nope'"));
+    CHECK(Post.updateMany("qty >= 4", {{"$inc", {{"price", 1}}}}).modifiedCount == 2);
+    CHECK(Post.find("at >= date('2026-11-18T19:00:00Z')").count() == 2);
+    CHECK(Post.find("at >= '2026-11-18T19:00:00Z'").count() == 2);  // text compared with a Date field: cast
+    CHECK(Post.deleteMany("qty > 100") == 0);
+
+    // builder with formulas
+    auto rev =
+        Post.aggregate().match("qty >= 1").group("", {sum("price * qty").as("revenue"), count()}).first().value();
+    CHECK(rev["count"].asInt() == 5 && rev["revenue"].asDouble() == 11 * 1 + 12 * 2 + 13 * 3 + 15 * 4 + 16 * 5);
+    auto withTotal = Post.aggregate().addField("total", "price * qty").match("total > 50").sort("-total").exec();
+    CHECK(withTotal.size() == 2 && withTotal[0]["total"].asInt() == 80);
+    auto labels = Post.aggregate()
+                      .addField("label", "if(price >= 13, 'costly', 'cheap')")
+                      .group("label", {count()})
+                      .sort("_id")
+                      .exec();
+    CHECK(labels.size() == 2 && labels[0]["_id"].asString() == "cheap" && labels[0]["count"].asInt() == 3);
+
+    // time buckets
+    auto q = Post.aggregate()
+                 .match("at < date('2026-11-18T12:00:00Z')")
+                 .bucketByTime("at", "15m", {count(), avg("price")})
+                 .exec();
+    CHECK(q.size() == 3 && q[0]["time"].asDate().iso() == "2026-11-18T10:00:00.000Z" && q[0]["count"].asInt() == 2);
+    CHECK(q[0].items()[0].first == "time");  // time is the first field
+    auto filled = Post.aggregate()
+                      .match("at < date('2026-11-18T12:00:00Z')")
+                      .bucketByTime("at", "15m", {count(), avg("price")}, {.fillGaps = true})
+                      .exec();
+    CHECK(filled.size() == 6);                                                 // 10:00 10:15 10:30 10:45 11:00 11:15
+    CHECK(filled[1]["count"].asInt() == 0 && filled[1]["avgPrice"].isNull());  // empty bucket: count 0
+    auto daysIst = Post.aggregate().bucketByTime("at", "1d", {count()}, {.timezone = "Asia/Kolkata"}).exec();
+    CHECK(daysIst.size() == 2 && daysIst[0]["count"].asInt() == 4);          // 19:00Z and 02:00Z are Nov 19 in India
+    CHECK(daysIst[0]["time"].asDate().iso() == "2026-11-17T18:30:00.000Z");  // local midnight
+    auto perAuthor = Post.aggregate().bucketByTime("at", "1d", {count()}, {.by = "author"}).exec();
+    CHECK(perAuthor.size() == 3 && perAuthor[0].contains("author"));
+
+    // one-line reports
+    Value byAuthor = Post.countBy("author");
+    CHECK(byAuthor[ana.id()].asInt() == 4 && byAuthor[bo.id()].asInt() == 2 && byAuthor.items()[0].first == ana.id());
+    CHECK(Post.countBy("author", "qty >= 4").size() == 1);
+    CHECK(Post.sumBy("author", "price")[bo.id()].asInt() == 15 + 16);
+    CHECK(Post.avgBy("author", "qty")[ana.id()].asDouble() == 1.5);
+    Value st = Post.stats("price");
+    CHECK(st["count"].asInt() == 6 && st["min"].asInt() == 10 && st["max"].asInt() == 16 && st["sum"].asInt() == 77);
+    CHECK(Post.stats("price", "qty > 100")["count"].asInt() == 0 && Post.stats("price", "qty > 100")["avg"].isNull());
+    auto latest = Post.latestPerGroup("author", "at");
+    CHECK(latest.size() == 2 && latest[0]["title"].asString() == "P5" && latest[1]["title"].asString() == "P3");
+
+    // populate inside the pipeline
+    PopulateOptions pa;
+    pa.path = "author";
+    pa.select = "name company";
+    PopulateOptions pc;
+    pc.path = "company";
+    pa.populate.push_back(pc);
+    auto rows = Post.aggregate().match("qty <= 1").populate(pa).populate("tags").sort("qty").exec();
+    CHECK(rows.size() == 2 && rows[0]["author"]["name"].asString() == "Ana");
+    CHECK(rows[0]["author"]["company"]["name"].asString() == "Acme");  // nested
+    CHECK(!rows[0]["author"].contains("pw"));                          // select(false) stays hidden
+    CHECK(rows[0]["tags"].size() == 2 &&
+          rows[0]["tags"].at(0)["label"].asString() == "z");  // order kept, missing dropped
+    CHECK(!rows[0].contains("__nv_pop"));
+    auto hidden = Post.aggregate().match("qty == 0").populate("author").first().value();
+    CHECK(hidden["author"]["name"].asString() == "Ana" && !hidden["author"].contains("pw"));
+    PopulateOptions nobody;
+    nobody.path = "author";
+    nobody.match = "name == 'Nobody'";  // filter may be a formula too
+    CHECK(Post.aggregate().match("qty == 0").populate(nobody).first().value()["author"].isNull());
+    PopulateOptions sorted;
+    sorted.path = "tags";
+    sorted.sort = "label";
+    sorted.limit = 1;
+    CHECK(Post.aggregate().match("qty == 0").populate(sorted).first().value()["tags"].at(0)["label"].asString() == "a");
+
+    // virtual populate in the pipeline + group on the result
+    PopulateOptions vp;
+    vp.path = "posts";
+    vp.sort = "-qty";
+    vp.limit = 2;
+    auto authors =
+        Author.aggregate().populate(vp).populate("firstPost").addField("postCount", "size(posts)").sort("name").exec();
+    CHECK(authors.size() == 3 && authors[0]["posts"].size() == 2 && authors[0]["posts"].at(0)["qty"].asInt() == 3);
+    CHECK(authors[0]["firstPost"].isObject() && authors[2]["firstPost"].isNull() &&
+          authors[2]["postCount"].asInt() == 0);
+
+    // explain / plan
+    CHECK(Post.aggregate().match("qty > 1").plan().find("IXSCAN(qty_1)") != std::string::npos);
+    CHECK(Post.aggregate().match("price > 1").plan().find("COLLSCAN") != std::string::npos);
+    CHECK(Post.aggregate().match("qty > 1").explain().isObject());
+
+    for (auto M : {Company, Author, Tag, Post}) M.dropCollection();
+}
+
 int main() {
     testValue();
     testSchemaOffline();
     testSchemaFeaturesOffline();
     testAggregateBuilderOffline();
+    testFormulasOffline();
 
     const char *env = std::getenv("NEVLA_TEST_URI");
     std::string uri = env ? env : "mongodb://127.0.0.1:27017/?directConnection=true";
@@ -1256,6 +1494,7 @@ int main() {
     testStaticsHooksDocs();
     testModelExtras();
     testAggregateBuilderDb();
+    testV04Db();
     disconnect();
     CHECK(!connected());
 

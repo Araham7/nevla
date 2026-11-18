@@ -1,6 +1,7 @@
 // End-to-end check with the aggregation builder: like an IoT backend.
 //  - 8 writer threads send telemetry for 20 devices (single inserts + batches + updates)
-//  - 3 reader threads build dashboard numbers at the same time
+//  - 5 reader threads build dashboard numbers at the same time (builder, formulas, time buckets,
+//    countBy, pipeline populate, latestPerGroup)
 //  - at the end every number from MongoDB is compared with what was actually sent
 // Exit code 0 = everything matched.
 #include <atomic>
@@ -48,7 +49,7 @@ int main(int argc, char **argv) {
 
     // What we sent, per device (to check MongoDB's answers later)
     struct Sent {
-        int64_t n = 0;
+        int64_t n = 0, hot = 0;  // hot = readings above 50
         double sum = 0, min = 1e18, max = -1e18;
     };
     std::map<std::string, Sent> sent;
@@ -68,6 +69,7 @@ int main(int argc, char **argv) {
             auto remember = [&](const std::string &id, double v) {
                 auto &s = mine[id];
                 s.n++;
+                s.hot += v > 50;
                 s.sum += v;
                 s.min = std::min(s.min, v);
                 s.max = std::max(s.max, v);
@@ -100,6 +102,7 @@ int main(int argc, char **argv) {
             for (auto &[id, s] : mine) {
                 auto &t = sent[id];
                 t.n += s.n;
+                t.hot += s.hot;
                 t.sum += s.sum;
                 t.min = std::min(t.min, s.min);
                 t.max = std::max(t.max, s.max);
@@ -107,7 +110,7 @@ int main(int argc, char **argv) {
         });
 
     // Dashboard readers running while data is still coming in
-    for (int r = 0; r < 3; r++)
+    for (int r = 0; r < 5; r++)
         threads.emplace_back([&, r] {
             while (writing) {
                 try {
@@ -119,12 +122,21 @@ int main(int argc, char **argv) {
                             .sort("-at")
                             .limit(20)
                             .exec();
-                    } else {
+                    } else if (r == 2) {
                         Reading.aggregate()
                             .lookup("DashDevice", "device", "_id", "dev")
                             .unwind("dev")
                             .group("dev.room", {avg("value"), count()})
                             .exec();
+                    } else if (r == 3) {
+                        Reading.aggregate()
+                            .match("value > 50")
+                            .bucketByTime("at", "1m", {count(), max("value")})
+                            .exec();
+                        Reading.countBy("device");
+                    } else {
+                        Reading.aggregate().populate("device").group("device.room", {count()}).exec();
+                        Reading.latestPerGroup("device", "at");
                     }
                     reads++;
                 } catch (const std::exception &e) {
@@ -192,6 +204,37 @@ int main(int argc, char **argv) {
     if (!note || (*note)["note"].asString() != "single ✓ ₹") bad("unicode note");
     if (Device.countDocuments({{"online", true}}) == 0) bad("device status updates");
 
+    // v0.4 helpers must agree with what was sent
+    int64_t hotSent = 0;
+    for (auto &[id, e] : sent) hotSent += e.hot;
+    if (Reading.find("value > 50").count() != hotSent) bad("formula filter count");
+    if (Reading.countDocuments("value > 50 && unit == 'C'") != hotSent) bad("formula with two conditions");
+    Value perDevice = Reading.countBy("device");
+    for (auto &[id, e] : sent)
+        if (perDevice[id].asInt() != e.n) bad("countBy " + id);
+    Value st = Reading.stats("value");
+    double minSent = 1e18, maxSent = -1e18;
+    for (auto &[id, e] : sent) minSent = std::min(minSent, e.min), maxSent = std::max(maxSent, e.max);
+    if (st["count"].asInt() != expected || st["min"].asDouble() != minSent || st["max"].asDouble() != maxSent)
+        bad("stats");
+    int64_t bucketTotal = 0;
+    for (auto &b : Reading.aggregate().bucketByTime("at", "1s", {count()}, {.fillGaps = true}).exec())
+        bucketTotal += b["count"].asInt();
+    if (bucketTotal != expected) bad("bucketByTime total");
+    int64_t hotBuckets = 0;
+    for (auto &b : Reading.aggregate().match("value > 50").bucketByTime("at", "1m", {count()}, {.by = "device"}).exec())
+        hotBuckets += b["count"].asInt();
+    if (hotBuckets != hotSent) bad("bucketByTime by device");
+    int64_t popTotal = 0;
+    for (auto &r : Reading.aggregate().populate("device").group("device.room", {count()}).exec())
+        popTotal += r["count"].asInt();
+    if (popTotal != expected) bad("pipeline populate total");
+    if ((int)Reading.latestPerGroup("device", "at").size() != (int)sent.size()) bad("latestPerGroup");
+    double sentSum = 0;
+    for (auto &[id, e] : sent) sentSum += e.sum;
+    double twice = Reading.aggregate().group("", {sum("value * 2").as("twice")}).first().value()["twice"].asDouble();
+    if (std::fabs(twice - 2 * sentSum) > 1e-6 * std::max(1.0, std::fabs(sentSum))) bad("formula accumulator");
+
     // bad input is rejected, not stored
     int rejected = 0;
     try {
@@ -214,7 +257,12 @@ int main(int argc, char **argv) {
     } catch (const CastError &) {
         rejected++;
     }
-    if (rejected != 4) bad("bad input accepted");
+    try {
+        Reading.find("value >> 3").count();
+    } catch (const FormulaError &) {
+        rejected++;
+    }
+    if (rejected != 5) bad("bad input accepted");
     if (Reading.countDocuments() != expected) bad("bad input was stored");
 
     std::cout << "sent " << expected << " readings from " << writers << " threads in " << secs << " s ("

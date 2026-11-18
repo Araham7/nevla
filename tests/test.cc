@@ -1053,7 +1053,16 @@ static void testModelExtras() {
         });
     const char *env = std::getenv("NEVLA_TEST_URI");
     std::string uri = env ? env : "mongodb://127.0.0.1:27017/?directConnection=true";
-    for (int i = 0; i < 5; i++) connect(uri, "nevla_test");
+    auto waitFor = [&](int n) {  // do not depend on thread start-up timing
+        for (int k = 0; k < 2000 && okOps < n; k++) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    };
+    waitFor(4);
+    for (int i = 0; i < 5; i++) {
+        connect(uri, "nevla_test");
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    int before = okOps;
+    waitFor(before + 4);  // operations keep working after the reconnects
     stop = true;
     for (auto &t : ts) t.join();
     CHECK(errors == 0 && okOps > 0);

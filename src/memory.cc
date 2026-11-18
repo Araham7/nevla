@@ -198,7 +198,7 @@ bool isOps(const Value &v) {
     return true;
 }
 
-std::vector<std::string> split(const std::string &path) {
+std::vector<std::string> splitRaw(const std::string &path) {
     std::vector<std::string> out;
     size_t start = 0;
     for (size_t i = 0; i <= path.size(); i++)
@@ -207,6 +207,15 @@ std::vector<std::string> split(const std::string &path) {
             start = i + 1;
         }
     return out;
+}
+
+// Paths repeat a lot (same field for every document): remember the split form
+const std::vector<std::string> &split(const std::string &path) {
+    thread_local std::unordered_map<std::string, std::vector<std::string>> cache;
+    auto it = cache.find(path);
+    if (it != cache.end()) return it->second;
+    // never erased: references stay valid (unordered_map keeps element addresses across rehashes)
+    return cache.emplace(path, splitRaw(path)).first->second;
 }
 
 bool numeric(const std::string &s) {
@@ -465,16 +474,29 @@ SortKey sortKey(const Value &doc, const std::string &path, int dir) {
 }
 
 void sortDocs(std::vector<Value> &docs, const Value &spec) {
-    if (!spec.isObject() || spec.empty()) return;
-    std::stable_sort(docs.begin(), docs.end(), [&](const Value &a, const Value &b) {
-        for (const auto &kv : spec.items()) {
-            int dir = kv.second.asInt(1) < 0 ? -1 : 1;
-            SortKey x = sortKey(a, kv.first, dir), y = sortKey(b, kv.first, dir);
+    if (!spec.isObject() || spec.empty() || docs.size() < 2) return;
+    // keys are computed once per document, not once per comparison
+    std::vector<int> dirs;
+    for (const auto &kv : spec.items()) dirs.push_back(kv.second.asInt(1) < 0 ? -1 : 1);
+    std::vector<std::vector<SortKey>> keys(docs.size());
+    for (size_t i = 0; i < docs.size(); i++) {
+        size_t k = 0;
+        for (const auto &kv : spec.items()) keys[i].push_back(sortKey(docs[i], kv.first, dirs[k++]));
+    }
+    std::vector<size_t> order(docs.size());
+    for (size_t i = 0; i < order.size(); i++) order[i] = i;
+    std::stable_sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        for (size_t k = 0; k < dirs.size(); k++) {
+            const SortKey &x = keys[a][k], &y = keys[b][k];
             int c = x.cls != y.cls ? (x.cls < y.cls ? -1 : 1) : cmpVal(x.v, y.v);
-            if (c) return dir > 0 ? c < 0 : c > 0;
+            if (c) return dirs[k] > 0 ? c < 0 : c > 0;
         }
         return false;
     });
+    std::vector<Value> sorted;
+    sorted.reserve(docs.size());
+    for (size_t i : order) sorted.push_back(std::move(docs[i]));
+    docs = std::move(sorted);
 }
 
 void setPathRaw(Value &doc, const std::vector<std::string> &segs, size_t i, Value v);
@@ -1576,7 +1598,7 @@ Value finish(const Acc &a) {
     return a.list;
 }
 
-std::vector<Value> groupStage(std::vector<Value> &docs, const Value &spec) {
+std::vector<Value> groupStage(const std::vector<Value> &docs, const Value &spec) {
     if (!spec.contains("_id")) throw Error("nevla memory database: $group needs an _id");
     struct G {
         Value id;
@@ -1658,6 +1680,22 @@ std::vector<Value> lookupStage(const std::string &db, std::vector<Value> &docs, 
         if (auto it = dbs.find(from); it != dbs.end()) foreign = it->second.docs;
     }
     bool hasLocal = spec.contains("localField");
+    // foreign field value -> foreign documents (arrays: every element and the array itself; missing = null)
+    std::unordered_map<std::string, std::vector<size_t>> byKey;
+    if (hasLocal) {
+        std::string ff = spec["foreignField"].str();
+        for (size_t i = 0; i < foreign.size(); i++) {
+            auto fc = candidates(foreign[i], ff);
+            std::set<std::string> keys;
+            if (fc.missing || fc.vals.empty()) keys.insert(keyOf(Value()));
+            for (const auto &v : fc.vals) {
+                keys.insert(keyOf(v));
+                if (v.isArray())
+                    for (const auto &e : v.elements()) keys.insert(keyOf(e));
+            }
+            for (const auto &k : keys) byKey[k].push_back(i);
+        }
+    }
     std::vector<Value> out;
     for (auto &d : docs) {
         std::vector<Value> hits;
@@ -1671,12 +1709,10 @@ std::vector<Value> lookupStage(const std::string &db, std::vector<Value> &docs, 
                     keys.push_back(l);
             }
             if (keys.empty()) keys.push_back(Value());  // missing local matches null / missing foreign
-            for (const auto &f : foreign) {
-                auto fc = candidates(f, spec["foreignField"].str());
-                bool hit = false;
-                for (const auto &k : keys) hit |= eqMatch(fc, k);
-                if (hit) hits.push_back(f);
-            }
+            std::set<size_t> picked;                    // foreign order, no duplicates
+            for (const auto &k : keys)
+                if (auto it = byKey.find(keyOf(k)); it != byKey.end()) picked.insert(it->second.begin(), it->second.end());
+            for (size_t i : picked) hits.push_back(foreign[i]);
         } else {
             hits = foreign;
         }
@@ -2084,7 +2120,23 @@ std::vector<Value> aggregate(const std::string &db, const std::string &name, con
             for (size_t k = i + 1; k < pipeline.size(); k++) rest.push_back(pipeline.at(k));
             return runPipeline(db, stats, rest);
         }
-    return runPipeline(db, coll(db, name).docs, pipeline);
+    // a leading $match filters while copying (no copy of the whole collection)
+    const auto &docs = coll(db, name).docs;
+    if (pipeline.size() && pipeline.at(0).isObject() && pipeline.at(0).size() == 1 && pipeline.at(0).contains("$match")) {
+        std::vector<Value> first;
+        const Value &f = pipeline.at(0)["$match"];
+        for (const auto &d : docs)
+            if (matches(d, f)) first.push_back(d);
+        Value rest = Value::array();
+        for (size_t k = 1; k < pipeline.size(); k++) rest.push_back(pipeline.at(k));
+        return runPipeline(db, std::move(first), rest);
+    }
+    if (pipeline.size() && pipeline.at(0).isObject() && pipeline.at(0).size() == 1 && pipeline.at(0).contains("$group")) {
+        Value rest = Value::array();  // a leading $group only reads: no copy of the collection
+        for (size_t k = 1; k < pipeline.size(); k++) rest.push_back(pipeline.at(k));
+        return runPipeline(db, groupStage(docs, pipeline.at(0)["$group"]), rest);
+    }
+    return runPipeline(db, docs, pipeline);
 }
 
 void createIndex(const std::string &db, const std::string &name, const Value &keys, const Value &options) {

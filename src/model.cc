@@ -9,6 +9,7 @@
 #include <condition_variable>
 #include <deque>
 #include <iostream>
+#include <list>
 #include <map>
 #include <mongocxx/bulk_write.hpp>
 #include <mongocxx/change_stream.hpp>
@@ -35,10 +36,13 @@
 #include <mongocxx/pool.hpp>
 #include <mongocxx/uri.hpp>
 #include <mutex>
+#include <random>
 #include <sstream>
 #include <thread>
+#include <unordered_map>
 
 #include "bson.hpp"
+#include "memory.hpp"
 #include "nevla/plugins.hpp"
 
 using bsoncxx::builder::basic::kvp;
@@ -49,9 +53,42 @@ namespace nevla {
 using detail::fromBson;
 using detail::toBson;
 
+// findById cache, shared by a model and its discriminators (same collection)
+struct ModelCache {
+    std::mutex mu;
+    bool on = false;
+    CacheOptions o;
+    using Clock = std::chrono::steady_clock;
+    std::list<std::string> lru;  // most recent first
+    struct Entry {
+        Value doc;
+        Clock::time_point at;
+        std::list<std::string>::iterator pos;
+    };
+    std::unordered_map<std::string, Entry> map;
+    int64_t hits = 0, misses = 0;
+    uint64_t gen = 0;  // bumped by every invalidation: a read that raced with a write is not stored
+
+    void clear() {
+        std::lock_guard<std::mutex> lk(mu);
+        gen++;
+        lru.clear();
+        map.clear();
+    }
+    void erase(const std::string &key) {
+        std::lock_guard<std::mutex> lk(mu);
+        gen++;
+        auto it = map.find(key);
+        if (it == map.end()) return;
+        lru.erase(it->second.pos);
+        map.erase(it);
+    }
+};
+
 struct ModelImpl {
     std::string name, collection;
     Schema schema;
+    std::shared_ptr<ModelCache> cache = std::make_shared<ModelCache>();
     std::string discKey, discValue;  // set on a discriminator child
     std::mutex childMu;
     std::map<std::string, std::shared_ptr<ModelImpl>> children;  // base model: type -> child
@@ -74,9 +111,10 @@ namespace {
 // A connection is shared: every running operation holds a reference, so connect() / disconnect() on another
 // thread never pulls the pool out from under it.
 struct Conn {
-    std::unique_ptr<mongocxx::pool> pool;
+    std::unique_ptr<mongocxx::pool> pool;  // null for the in-memory database
     std::string db;
     uint64_t gen = 0;
+    bool memory = false;  // connect("memory://...")
 };
 std::mutex gConnMu;
 std::shared_ptr<Conn> gConn;
@@ -283,6 +321,10 @@ std::vector<IndexDef> wantedIndexes(ModelImpl &m) {
 }
 
 void createIndexesNow(ModelImpl &m, Conn &c) {
+    if (c.memory) {
+        for (const auto &i : wantedIndexes(m)) mem::createIndex(c.db, m.collection, i.keys, i.options);
+        return;
+    }
     guard([&] {
         auto entry = c.pool->acquire();
         auto coll = (*entry)[c.db][m.collection];
@@ -304,6 +346,12 @@ void createCollectionNow(ModelImpl &m, Conn &c) {
     if (!ts.granularity.empty()) t["granularity"] = ts.granularity;
     cmd["timeseries"] = t;
     if (ts.expireAfterSeconds > 0) cmd["expireAfterSeconds"] = ts.expireAfterSeconds;
+    if (c.memory) {
+        Value opts = cmd;
+        opts.erase("create");
+        mem::createCollection(c.db, m.collection, opts);
+        return;
+    }
     try {
         auto entry = c.pool->acquire();
         OpTrace nv_trace(m.collection, "createCollection", cmd);
@@ -330,6 +378,15 @@ void ensureIndexes(ModelImpl &m, Conn &c) {
     m.indexGen = c.gen;
 }
 
+// The in-memory database, if that is what we are connected to (indexes / collection prepared)
+std::shared_ptr<Conn> memDb(ModelImpl &m) {
+    if (tTx.client) return nullptr;
+    auto c = currentConn();
+    if (!c->memory) return nullptr;
+    ensureIndexes(m, *c);
+    return c;
+}
+
 Op open(ModelImpl &m) {
     Op o;
     if (tTx.client) {
@@ -339,6 +396,7 @@ Op open(ModelImpl &m) {
         o.coll = (*tTx.client)[o.conn->db][m.collection];
     } else {
         o.conn = currentConn();
+        if (o.conn->memory) throw Error("nevla memory database: this operation is not supported");
         ensureIndexes(m, *o.conn);
         o.entry.emplace(o.conn->pool->acquire());
         o.coll = (**o.entry)[o.conn->db][m.collection];
@@ -1019,46 +1077,123 @@ void depopulatePath(const Schema &s, Value &data, const std::string &path) {
 }
 
 /* ---------------- find / update / delete ---------------- */
+std::string cacheKey(const Value &id) { return std::to_string(static_cast<int>(id.type())) + ":" + id.toJson(); }
+
+// Any write through nevla: forget one document (id) or everything
+void cacheInvalidate(ModelImpl &m, const Value *id = nullptr) {
+    if (!m.cache->on) return;
+    if (id)
+        m.cache->erase(cacheKey(*id));
+    else
+        m.cache->clear();
+}
+
+// findById() that the cache may answer
+bool cacheable(const ModelImpl &m, const detail::QuerySpec &spec) {
+    if (!m.cache->on || tTx.client) return false;
+    if (spec.filter.size() != 1 || !spec.filter.contains("_id")) return false;
+    const Value &id = spec.filter["_id"];
+    if (id.isObject() || id.isArray() || id.isNull()) return false;
+    std::string sel = spec.select;
+    sel.erase(std::remove(sel.begin(), sel.end(), ' '), sel.end());
+    if (!sel.empty() || !spec.populate.empty() || spec.skip || spec.hint.isObject() || spec.hint.isString() ||
+        spec.collation.isObject())
+        return false;
+    return !m.schema.preQuery_.count("findOne") && !m.schema.postQuery_.count("findOne");
+}
+
 std::vector<Value> runFind(const std::shared_ptr<ModelImpl> &m, const detail::QuerySpec &spec, bool one,
                            const char *opName) {
-    Value filter = prepareFilter(*m, spec.filter);
-    runQueryHooks(*m, opName, filter, nullptr);
-    mongocxx::options::find opts;
-    applyFindOptions(opts, spec, m->schema, one);
+    bool useCache = one && std::string(opName) == "findOne" && cacheable(*m, spec);
+    std::string key;
+    uint64_t genBefore = 0;
+    if (useCache) {
+        Value id = spec.filter["_id"];
+        if (id.isString() && ObjectId::isValid(id.asString()) && !m->schema.hasOwnId()) id = ObjectId(id.asString());
+        key = cacheKey(id);
+        ModelCache &c = *m->cache;
+        std::lock_guard<std::mutex> lk(c.mu);
+        auto it = c.map.find(key);
+        if (it != c.map.end() && ModelCache::Clock::now() - it->second.at < std::chrono::milliseconds(c.o.ttlMs)) {
+            c.hits++;
+            c.lru.splice(c.lru.begin(), c.lru, it->second.pos);
+            const Value &doc = it->second.doc;
+            if (!m->discKey.empty() && doc[m->discKey].asString() != m->discValue) return {};  // another type
+            return {doc};
+        }
+        if (it != c.map.end()) {  // expired
+            c.lru.erase(it->second.pos);
+            c.map.erase(it);
+        }
+        c.misses++;
+        genBefore = c.gen;
+    }
+    std::vector<Value> found = [&]() -> std::vector<Value> {
+        Value filter = prepareFilter(*m, spec.filter);
+        runQueryHooks(*m, opName, filter, nullptr);
+        mongocxx::options::find opts;
+        applyFindOptions(opts, spec, m->schema, one);
 
-    std::vector<Value> out;
-    guard([&] {
-        Op o = open(*m);
-        OpTrace nv_trace(m->collection, opName, Value{{"filter", filter}, {"sort", spec.sort}, {"limit", spec.limit}});
-        retryRead([&] {
+        std::vector<Value> out;
+        if (auto mc = memDb(*m)) {
+            OpTrace nv_trace(m->collection, opName,
+                             Value{{"filter", filter}, {"sort", spec.sort}, {"limit", spec.limit}});
+            if (spec.collation.isObject()) throw Error("nevla memory database: collation() is not supported");
+            mem::FindSpec fs;
+            fs.filter = filter;
+            fs.sort = spec.sort;
+            fs.projection = buildProjection(m->schema, spec.select);
+            fs.skip = spec.skip;
+            fs.limit = one ? 1 : spec.limit;
+            out = mem::find(mc->db, m->collection, fs);
+        } else
+            guard([&] {
+                Op o = open(*m);
+                OpTrace nv_trace(m->collection, opName,
+                                 Value{{"filter", filter}, {"sort", spec.sort}, {"limit", spec.limit}});
+                retryRead([&] {
+                    out.clear();
+                    auto cursor = NV(o, find, toBson(filter), opts);
+                    for (auto &&doc : cursor) out.push_back(fromBson(doc));
+                });
+            });
+        decryptAll(out);
+        if (!spec.populate.empty() && !out.empty()) {
+            std::vector<Value *> ptrs;
+            for (auto &v : out) ptrs.push_back(&v);
+            for (const auto &p : spec.populate) populateValues(m, ptrs, p);
+        }
+        if (hasPostHooks(*m, opName)) {
+            Value result;
+            if (one) {
+                result = out.empty() ? Value() : out[0];
+            } else {
+                result = Value::array();
+                for (auto &v : out) result.push_back(std::move(v));
+            }
+            runPostHooks(*m, opName, filter, nullptr, result);
             out.clear();
-            auto cursor = NV(o, find, toBson(filter), opts);
-            for (auto &&doc : cursor) out.push_back(fromBson(doc));
-        });
-    });
-    decryptAll(out);
-    if (!spec.populate.empty() && !out.empty()) {
-        std::vector<Value *> ptrs;
-        for (auto &v : out) ptrs.push_back(&v);
-        for (const auto &p : spec.populate) populateValues(m, ptrs, p);
-    }
-    if (hasPostHooks(*m, opName)) {
-        Value result;
-        if (one) {
-            result = out.empty() ? Value() : out[0];
-        } else {
-            result = Value::array();
-            for (auto &v : out) result.push_back(std::move(v));
+            if (one) {
+                if (!result.isNull()) out.push_back(std::move(result));
+            } else {
+                for (auto &v : result.elements()) out.push_back(std::move(v));
+            }
         }
-        runPostHooks(*m, opName, filter, nullptr, result);
-        out.clear();
-        if (one) {
-            if (!result.isNull()) out.push_back(std::move(result));
-        } else {
-            for (auto &v : result.elements()) out.push_back(std::move(v));
+        return out;
+    }();
+    if (useCache && found.size() == 1) {
+        ModelCache &c = *m->cache;
+        std::lock_guard<std::mutex> lk(c.mu);
+        if (!c.map.count(key) && c.gen == genBefore) {
+            c.lru.push_front(key);
+            c.map[key] = ModelCache::Entry{found[0], ModelCache::Clock::now(), c.lru.begin()};
+            while (c.map.size() > c.o.maxEntries && !c.lru.empty()) {
+                c.map.erase(c.lru.back());
+                c.lru.pop_back();
+            }
         }
     }
-    return out;
+    return found;
 }
 
 Value idFilter(const Value &id) {
@@ -1082,17 +1217,24 @@ UpdateResult runUpdate(const std::shared_ptr<ModelImpl> &m, const Value &filterI
     if (update.empty()) return res;
     mongocxx::options::update opts;
     if (options.upsert) opts.upsert(true);
-    guard([&] {
-        Op o = open(*m);
+    if (auto mc = memDb(*m)) {
         OpTrace nv_trace(m->collection, opName,
                          Value{{"filter", filter}, {"update", update}, {"upsert", options.upsert}});
-        auto r = many ? NV(o, update_many, toBson(filter), toBson(update), opts)
-                      : NV(o, update_one, toBson(filter), toBson(update), opts);
-        if (!r) return;
-        res.matchedCount = r->matched_count();
-        res.modifiedCount = r->modified_count();
-        if (auto id = r->upserted_id()) res.upsertedId = fromBson(id->get_value());
-    });
+        auto r = mem::update(mc->db, m->collection, filter, update, options.upsert, many);
+        res = UpdateResult{r.matched, r.modified, r.upsertedId};
+    } else
+        guard([&] {
+            Op o = open(*m);
+            OpTrace nv_trace(m->collection, opName,
+                             Value{{"filter", filter}, {"update", update}, {"upsert", options.upsert}});
+            auto r = many ? NV(o, update_many, toBson(filter), toBson(update), opts)
+                          : NV(o, update_one, toBson(filter), toBson(update), opts);
+            if (!r) return;
+            res.matchedCount = r->matched_count();
+            res.modifiedCount = r->modified_count();
+            if (auto id = r->upserted_id()) res.upsertedId = fromBson(id->get_value());
+        });
+    cacheInvalidate(*m);
     if (hasPostHooks(*m, opName)) {
         Value result = updateResultValue(res);
         runPostHooks(*m, opName, filter, &update, result);
@@ -1105,11 +1247,16 @@ int64_t runDelete(const std::shared_ptr<ModelImpl> &m, const Value &filterIn, bo
     Value filter = prepareFilter(*m, filterIn);
     runQueryHooks(*m, opName, filter, nullptr);
     int64_t n = guard([&]() -> int64_t {
+        if (auto mc = memDb(*m)) {
+            OpTrace nv_trace(m->collection, opName, Value{{"filter", filter}});
+            return mem::remove(mc->db, m->collection, filter, many);
+        }
         Op o = open(*m);
         OpTrace nv_trace(m->collection, opName, Value{{"filter", filter}});
         auto r = many ? NV(o, delete_many, toBson(filter)) : NV(o, delete_one, toBson(filter));
         return r ? r->deleted_count() : 0;
     });
+    cacheInvalidate(*m);
     if (hasPostHooks(*m, opName)) {
         Value result{{"deletedCount", n}};
         runPostHooks(*m, opName, filter, nullptr, result);
@@ -1126,6 +1273,11 @@ int64_t runCount(const std::shared_ptr<ModelImpl> &m, const detail::QuerySpec &s
     if (spec.hint.isObject()) opts.hint(mongocxx::hint(toBson(spec.hint)));
     if (spec.collation.isObject()) opts.collation(toBson(spec.collation));
     int64_t n = guard([&]() -> int64_t {
+        if (auto mc = memDb(*m)) {
+            OpTrace nv_trace(m->collection, "countDocuments", Value{{"filter", filter}});
+            if (spec.collation.isObject()) throw Error("nevla memory database: collation() is not supported");
+            return mem::count(mc->db, m->collection, filter);
+        }
         Op o = open(*m);
         OpTrace nv_trace(m->collection, "countDocuments", Value{{"filter", filter}});
         return NV(o, count_documents, toBson(filter), opts);
@@ -1143,15 +1295,18 @@ std::vector<Value> runDistinct(const std::shared_ptr<ModelImpl> &m, const std::s
     runQueryHooks(*m, "distinct", filter, nullptr);
     std::string path = m->schema.resolveAlias(field);
     std::vector<Value> out;
-    guard([&] {
-        Op o = open(*m);
-        OpTrace nv_trace(m->collection, "distinct", Value{{"field", path}, {"filter", filter}});
-        auto cursor = NV(o, distinct, path, toBson(filter));
-        for (auto &&doc : cursor) {
-            Value row = fromBson(doc);
-            for (const auto &e : row["values"].elements()) out.push_back(e);
-        }
-    });
+    if (auto mc = memDb(*m))
+        out = mem::distinct(mc->db, m->collection, path, filter);
+    else
+        guard([&] {
+            Op o = open(*m);
+            OpTrace nv_trace(m->collection, "distinct", Value{{"field", path}, {"filter", filter}});
+            auto cursor = NV(o, distinct, path, toBson(filter));
+            for (auto &&doc : cursor) {
+                Value row = fromBson(doc);
+                for (const auto &e : row["values"].elements()) out.push_back(e);
+            }
+        });
     decryptAll(out);
     return out;
 }
@@ -1200,6 +1355,8 @@ struct CursorImpl {
     std::unique_ptr<mongocxx::cursor> cursor;
     std::optional<mongocxx::cursor::iterator> it;
     bool done = false;
+    std::optional<std::vector<Value>> rows;  // in-memory database: all results
+    size_t pos = 0;
 };
 
 struct ChangeStreamImpl {
@@ -1210,6 +1367,18 @@ struct ChangeStreamImpl {
 
 /* ======================= connection ======================= */
 void connect(const std::string &uri, const std::string &dbName) {
+    if (uri.rfind("memory://", 0) == 0) {  // in-memory database (tests, demos): no server needed
+        auto c = std::make_shared<Conn>();
+        c->memory = true;
+        std::string fromUri = uri.substr(9);
+        if (auto q = fromUri.find('?'); q != std::string::npos) fromUri = fromUri.substr(0, q);
+        while (!fromUri.empty() && fromUri.back() == '/') fromUri.pop_back();
+        c->db = !dbName.empty() ? dbName : !fromUri.empty() ? fromUri : "test";
+        c->gen = ++gGeneration;
+        std::lock_guard<std::mutex> lk(gConnMu);
+        gConn = std::move(c);
+        return;
+    }
     mongocxx::instance::current();
     guard([&] {
         mongocxx::uri u{uri};
@@ -1244,6 +1413,7 @@ std::string databaseName() { return currentConn()->db; }
 
 void ping() {
     auto c = currentConn();
+    if (c->memory) return;
     guard([&] {
         auto entry = c->pool->acquire();
         (*entry)[c->db].run_command(make_document(kvp("ping", 1)));
@@ -1256,6 +1426,10 @@ void transaction(const std::function<void()> &fn) {
         return;
     }
     auto c = currentConn();
+    if (c->memory) {
+        mem::transaction(c->db, fn);
+        return;
+    }
     guard([&] {
         auto entry = c->pool->acquire();
         auto session = entry->start_session();
@@ -1507,6 +1681,11 @@ Document &Document::save() {
         for (const auto &p : populated_) depopulatePath(m_->schema, stored, p);
         encryptDoc(m_->schema, stored);  // the Document keeps the plain text
         guard([&] {
+            if (auto mc = memDb(*m_)) {
+                OpTrace nv_trace(m_->collection, "insertOne", stored);
+                mem::insertOne(mc->db, m_->collection, stored);
+                return;
+            }
             Op o = open(*m_);
             OpTrace nv_trace(m_->collection, "insertOne", stored);
             NV(o, insert_one, toBson(stored));
@@ -1556,6 +1735,10 @@ Document &Document::save() {
         if (bump) update["$inc"][vk] = 1;
         if (!update.empty()) {
             int64_t matched = guard([&]() -> int64_t {
+                if (auto mc = memDb(*m_)) {
+                    OpTrace nv_trace(m_->collection, "updateOne", Value{{"filter", filter}, {"update", update}});
+                    return mem::update(mc->db, m_->collection, filter, update, false, false).matched;
+                }
                 Op o = open(*m_);
                 OpTrace nv_trace(m_->collection, "updateOne", Value{{"filter", filter}, {"update", update}});
                 auto r = NV(o, update_one, toBson(filter), toBson(update));
@@ -1563,6 +1746,7 @@ Document &Document::save() {
             });
             if (matched == 0) {
                 bool exists = guard([&]() -> bool {
+                    if (auto mc = memDb(*m_)) return mem::count(mc->db, m_->collection, idFilter(data_["_id"])) > 0;
                     Op o = open(*m_);
                     return NV(o, count_documents, toBson(idFilter(data_["_id"]))) > 0;
                 });
@@ -1573,6 +1757,7 @@ Document &Document::save() {
                                     " was not found in the database");
             }
             if (bump) data_[vk] = data_[vk].asInt(0) + 1;
+            cacheInvalidate(*m_, &data_["_id"]);
         }
         modified_.clear();
         bumpVersion_ = false;
@@ -1585,10 +1770,15 @@ void Document::deleteOne() {
     if (!m_) throw Error("nevla: this Document has no model");
     runDocHooks(m_->schema.preDoc_, "deleteOne", *this);
     guard([&] {
+        if (auto mc = memDb(*m_)) {
+            mem::remove(mc->db, m_->collection, idFilter(data_["_id"]), false);
+            return;
+        }
         Op o = open(*m_);
         OpTrace nv_trace(m_->collection, "deleteOne", idFilter(data_["_id"]));
         NV(o, delete_one, toBson(idFilter(data_["_id"])));
     });
+    cacheInvalidate(*m_, &data_["_id"]);
     runDocHooks(m_->schema.postDoc_, "deleteOne", *this);
 }
 
@@ -1690,11 +1880,20 @@ Cursor Query::cursor() {
     runQueryHooks(*m_, "find", filter, nullptr);
     mongocxx::options::find opts;
     applyFindOptions(opts, spec_, m_->schema, false);
-    guard([&] {
-        impl->op = open(*m_);
-        OpTrace nv_trace(m_->collection, "find (cursor)", Value{{"filter", filter}});
-        impl->cursor = std::make_unique<mongocxx::cursor>(NV(impl->op, find, toBson(filter), opts));
-    });
+    if (auto mc = memDb(*m_)) {
+        mem::FindSpec fs;
+        fs.filter = filter;
+        fs.sort = spec_.sort;
+        fs.projection = buildProjection(m_->schema, spec_.select);
+        fs.skip = spec_.skip;
+        fs.limit = spec_.limit;
+        impl->rows = mem::find(mc->db, m_->collection, fs);
+    } else
+        guard([&] {
+            impl->op = open(*m_);
+            OpTrace nv_trace(m_->collection, "find (cursor)", Value{{"filter", filter}});
+            impl->cursor = std::make_unique<mongocxx::cursor>(NV(impl->op, find, toBson(filter), opts));
+        });
     Cursor c;
     c.impl_ = std::move(impl);
     return c;
@@ -1704,6 +1903,10 @@ std::optional<Value> Cursor::nextLean() {
     if (!impl_ || impl_->done) return std::nullopt;
     auto &I = *impl_;
     std::optional<Value> v = guard([&]() -> std::optional<Value> {
+        if (I.rows) {
+            if (I.pos >= I.rows->size()) return std::nullopt;
+            return std::move((*I.rows)[I.pos++]);
+        }
         if (!I.it)
             I.it.emplace(I.cursor->begin());
         else
@@ -1834,6 +2037,16 @@ std::vector<Document> Model::insertMany(const std::vector<Value> &objects, Inser
     mongocxx::options::insert opts;
     opts.ordered(options.ordered);
     guard([&] {
+        if (auto mc = memDb(*m_)) {
+            std::vector<Value> plain;
+            for (const auto &r : raw) plain.push_back(fromBson(r.view()));
+            auto r = mem::insertMany(mc->db, m_->collection, plain, options.ordered);
+            if (!r.error.empty()) {
+                if (r.error.find("E11000") != std::string::npos) throw DuplicateKeyError(r.error);
+                throw Error(r.error);
+            }
+            return;
+        }
         Op o = open(*m_);
         OpTrace nv_trace(m_->collection, "insertMany", Value{{"count", static_cast<int64_t>(raw.size())}});
         NV(o, insert_many, raw, opts);
@@ -1869,15 +2082,20 @@ UpdateResult Model::replaceOne(const Value &filterIn, const Value &replacement, 
     mongocxx::options::replace opts;
     if (options.upsert) opts.upsert(true);
     UpdateResult res;
-    guard([&] {
-        Op o = open(*m_);
-        OpTrace nv_trace(m_->collection, "replaceOne", Value{{"filter", filter}, {"replacement", doc}});
-        auto r = NV(o, replace_one, toBson(filter), toBson(doc), opts);
-        if (!r) return;
-        res.matchedCount = r->matched_count();
-        res.modifiedCount = r->modified_count();
-        if (auto id = r->upserted_id()) res.upsertedId = fromBson(id->get_value());
-    });
+    if (auto mc = memDb(*m_)) {
+        auto r = mem::replace(mc->db, m_->collection, filter, doc, options.upsert);
+        res = UpdateResult{r.matched, r.modified, r.upsertedId};
+    } else
+        guard([&] {
+            Op o = open(*m_);
+            OpTrace nv_trace(m_->collection, "replaceOne", Value{{"filter", filter}, {"replacement", doc}});
+            auto r = NV(o, replace_one, toBson(filter), toBson(doc), opts);
+            if (!r) return;
+            res.matchedCount = r->matched_count();
+            res.modifiedCount = r->modified_count();
+            if (auto id = r->upserted_id()) res.upsertedId = fromBson(id->get_value());
+        });
+    cacheInvalidate(*m_);
     if (hasPostHooks(*m_, "replaceOne")) {
         Value result = updateResultValue(res);
         runPostHooks(*m_, "replaceOne", filter, &doc, result);
@@ -1901,6 +2119,12 @@ std::optional<Document> Model::findOneAndUpdate(const Value &filterIn, const Val
     Value proj = buildProjection(m_->schema, options.select);
     if (!proj.empty()) opts.projection(toBson(proj));
     auto found = guard([&]() -> std::optional<Value> {
+        if (auto mc = memDb(*m_)) {
+            auto v =
+                mem::findOneAndUpdate(mc->db, m_->collection, filter, update, options.upsert, options.returnNew, proj);
+            if (v) decryptAll(*v);
+            return v;
+        }
         Op o = open(*m_);
         OpTrace nv_trace(m_->collection, "findOneAndUpdate", Value{{"filter", filter}, {"update", update}});
         auto r = NV(o, find_one_and_update, toBson(filter), toBson(update), opts);
@@ -1909,6 +2133,7 @@ std::optional<Document> Model::findOneAndUpdate(const Value &filterIn, const Val
         decryptAll(v);
         return v;
     });
+    cacheInvalidate(*m_);
     if (hasPostHooks(*m_, "findOneAndUpdate")) {
         Value result = found ? *found : Value();
         runPostHooks(*m_, "findOneAndUpdate", filter, &update, result);
@@ -1935,6 +2160,12 @@ std::optional<Document> Model::findOneAndReplace(const Value &filterIn, const Va
     Value proj = buildProjection(m_->schema, options.select);
     if (!proj.empty()) opts.projection(toBson(proj));
     auto found = guard([&]() -> std::optional<Value> {
+        if (auto mc = memDb(*m_)) {
+            auto v =
+                mem::findOneAndReplace(mc->db, m_->collection, filter, doc, options.upsert, options.returnNew, proj);
+            if (v) decryptAll(*v);
+            return v;
+        }
         Op o = open(*m_);
         OpTrace nv_trace(m_->collection, "findOneAndReplace", Value{{"filter", filter}, {"replacement", doc}});
         auto r = NV(o, find_one_and_replace, toBson(filter), toBson(doc), opts);
@@ -1943,6 +2174,7 @@ std::optional<Document> Model::findOneAndReplace(const Value &filterIn, const Va
         decryptAll(v);
         return v;
     });
+    cacheInvalidate(*m_);
     if (hasPostHooks(*m_, "findOneAndReplace")) {
         Value result = found ? *found : Value();
         runPostHooks(*m_, "findOneAndReplace", filter, &doc, result);
@@ -1956,6 +2188,11 @@ std::optional<Document> Model::findOneAndDelete(const Value &filterIn) const {
     Value filter = prepareFilter(*m_, filterIn);
     runQueryHooks(*m_, "findOneAndDelete", filter, nullptr);
     auto found = guard([&]() -> std::optional<Value> {
+        if (auto mc = memDb(*m_)) {
+            auto v = mem::findOneAndDelete(mc->db, m_->collection, filter);
+            if (v) decryptAll(*v);
+            return v;
+        }
         Op o = open(*m_);
         OpTrace nv_trace(m_->collection, "findOneAndDelete", Value{{"filter", filter}});
         auto r = NV(o, find_one_and_delete, toBson(filter));
@@ -1964,6 +2201,7 @@ std::optional<Document> Model::findOneAndDelete(const Value &filterIn) const {
         decryptAll(v);
         return v;
     });
+    cacheInvalidate(*m_);
     if (hasPostHooks(*m_, "findOneAndDelete")) {
         Value result = found ? *found : Value();
         runPostHooks(*m_, "findOneAndDelete", filter, nullptr, result);
@@ -2022,6 +2260,42 @@ BulkWriteResult Model::bulkWrite(const std::vector<Value> &operations, bool orde
         }
     }
     if (ops.empty()) return res;
+    struct Clear {  // whatever happens, cached documents may be stale now
+        ModelImpl &m;
+        ~Clear() { cacheInvalidate(m); }
+    } clearCache{*m_};
+    if (auto mc = memDb(*m_)) {  // one by one; ordered stops at the first error, unordered goes on
+        std::string firstError;
+        for (const auto &p : ops) {
+            try {
+                Value a = fromBson(p.a.view()), b = fromBson(p.b.view());
+                if (p.kind == "insertOne") {
+                    mem::insertOne(mc->db, m_->collection, a);
+                    res.insertedCount++;
+                } else if (p.kind == "updateOne" || p.kind == "updateMany") {
+                    auto r = mem::update(mc->db, m_->collection, a, b, p.upsert, p.kind == "updateMany");
+                    res.matchedCount += r.matched;
+                    res.modifiedCount += r.modified;
+                    res.upsertedCount += !r.upsertedId.isNull();
+                } else if (p.kind == "replaceOne") {
+                    auto r = mem::replace(mc->db, m_->collection, a, b, p.upsert);
+                    res.matchedCount += r.matched;
+                    res.modifiedCount += r.modified;
+                    res.upsertedCount += !r.upsertedId.isNull();
+                } else {
+                    res.deletedCount += mem::remove(mc->db, m_->collection, a, p.kind == "deleteMany");
+                }
+            } catch (const Error &e) {
+                if (firstError.empty()) firstError = e.what();
+                if (ordered) break;
+            }
+        }
+        if (!firstError.empty()) {
+            if (firstError.find("E11000") != std::string::npos) throw DuplicateKeyError(firstError);
+            throw Error(firstError);
+        }
+        return res;
+    }
     guard([&] {
         Op o = open(*m_);
         OpTrace nv_trace(m_->collection, "bulkWrite", Value{{"operations", static_cast<int64_t>(ops.size())}});
@@ -2064,6 +2338,7 @@ int64_t Model::countDocuments(const Value &filter) const { return Query(m_, filt
 
 int64_t Model::estimatedDocumentCount() const {
     return guard([&]() -> int64_t {
+        if (auto mc = memDb(*m_)) return mem::estimatedCount(mc->db, m_->collection);
         Op o = open(*m_);
         return o.coll.estimated_document_count();
     });
@@ -2129,21 +2404,29 @@ std::vector<Value> runAggregate(const std::shared_ptr<ModelImpl> &m, Value stage
     if (o.hint.isString()) opts.hint(mongocxx::hint(o.hint.asString()));
     if (o.hint.isObject()) opts.hint(mongocxx::hint(toBson(o.hint)));
     std::vector<Value> out;
-    guard([&] {
-        Op op = open(*m);
+    if (auto mc = memDb(*m)) {
         OpTrace nv_trace(m->collection, "aggregate", Value{{"pipeline", stages}});
-        bool writes = false;  // $out / $merge must not run twice
-        for (const auto &st : stages.elements()) writes |= st.contains("$out") || st.contains("$merge");
-        auto run = [&] {
-            out.clear();
-            auto cursor = NV(op, aggregate, p, opts);
-            for (auto &&doc : cursor) out.push_back(fromBson(doc));
-        };
-        if (writes)
-            run();
-        else
-            retryRead(run);
-    });
+        if (o.collation.isObject()) throw Error("nevla memory database: collation is not supported");
+        Value full = Value::array();
+        if (!m->discKey.empty()) full.push_back(Value{{"$match", Value{{m->discKey, m->discValue}}}});
+        for (const auto &st : stages.elements()) full.push_back(st);
+        out = mem::aggregate(mc->db, m->collection, full);
+    } else
+        guard([&] {
+            Op op = open(*m);
+            OpTrace nv_trace(m->collection, "aggregate", Value{{"pipeline", stages}});
+            bool writes = false;  // $out / $merge must not run twice
+            for (const auto &st : stages.elements()) writes |= st.contains("$out") || st.contains("$merge");
+            auto run = [&] {
+                out.clear();
+                auto cursor = NV(op, aggregate, p, opts);
+                for (auto &&doc : cursor) out.push_back(fromBson(doc));
+            };
+            if (writes)
+                run();
+            else
+                retryRead(run);
+        });
     decryptAll(out);
     if (hasPostHooks(*m, "aggregate")) {
         Value result = Value::array();
@@ -2647,6 +2930,7 @@ Value Aggregate::explain() const {
     Value cmd = Value::object();
     cmd["explain"] = Value{{"aggregate", m_->collection}, {"pipeline", pipeline()}, {"cursor", Value::object()}};
     cmd["verbosity"] = "queryPlanner";
+    if (c->memory) return Value{{"memory", true}, {"queryPlanner", Value{{"winningPlan", Value{{"stage", "MEMORY"}}}}}};
     return guard([&]() -> Value {
         auto entry = c->pool->acquire();
         return fromBson((*entry)[c->db].run_command(toBson(cmd)).view());
@@ -2727,6 +3011,7 @@ ChangeStream Model::watch(const Value &pipeline, WatchOptions options) const {
     mongocxx::options::change_stream opts;
     if (options.fullDocument) opts.full_document("updateLookup");
     if (options.maxAwaitMS > 0) opts.max_await_time(std::chrono::milliseconds(options.maxAwaitMS));
+    if (currentConn()->memory) throw Error("nevla memory database: watch() (change streams) is not supported");
     guard([&] {
         impl->op = open(*m_);
         OpTrace nv_trace(m_->collection, "watch", pipeline);
@@ -2752,6 +3037,7 @@ void Model::createIndexes() const {
 
 std::vector<Value> Model::listIndexes() const {
     std::vector<Value> out;
+    if (auto mc = memDb(*m_)) return mem::listIndexes(mc->db, m_->collection);
     guard([&] {
         Op o = open(*m_);
         auto cursor = o.coll.list_indexes();
@@ -2780,6 +3066,10 @@ void Model::syncIndexes() const {
         for (const auto &kv : idx["key"].items())
             keys[kv.first] = kv.second.isNumber() ? Value(static_cast<int64_t>(kv.second.asDouble())) : kv.second;
         if (keep.count(keys.toJson())) continue;
+        if (auto mc = memDb(*m_)) {
+            mem::dropIndex(mc->db, m_->collection, name);
+            continue;
+        }
         guard([&] {
             Op o = open(*m_);
             OpTrace nv_trace(m_->collection, "dropIndex", Value(name));
@@ -2789,11 +3079,16 @@ void Model::syncIndexes() const {
 }
 
 void Model::dropCollection() const {
-    guard([&] {
-        Op o = open(*m_);
-        OpTrace nv_trace(m_->collection, "drop", Value::object());
-        o.coll.drop();
-    });
+    auto c = currentConn();
+    if (c->memory)
+        mem::drop(c->db, m_->collection);
+    else
+        guard([&] {
+            Op o = open(*m_);
+            OpTrace nv_trace(m_->collection, "drop", Value::object());
+            o.coll.drop();
+        });
+    cacheInvalidate(*m_);
     m_->indexGen = 0;  // recreate indexes before the next operation
     std::lock_guard<std::mutex> lk(m_->childMu);
     for (auto &ch : m_->children) ch.second->indexGen = 0;
@@ -2807,6 +3102,7 @@ Model Model::discriminator(const std::string &name, const Schema &extra) const {
     child->schema.add(extra);
     child->discKey = m_->schema.options.discriminatorKey;
     child->discValue = name;
+    child->cache = m_->cache;  // same collection, same cache
     {
         std::lock_guard<std::mutex> lk(m_->childMu);
         m_->children[name] = child;
@@ -2821,6 +3117,10 @@ void Model::createCollection() const {
     auto c = currentConn();
     createCollectionNow(*m_, *c);
     if (m_->schema.options.timeseries.timeField.empty()) {
+        if (c->memory) {
+            mem::createCollection(c->db, m_->collection, Value::object());
+            return;
+        }
         try {
             auto entry = c->pool->acquire();
             (*entry)[c->db].run_command(make_document(kvp("create", m_->collection)));
@@ -2832,6 +3132,7 @@ void Model::createCollection() const {
 
 Value Model::collectionInfo() const {
     auto c = currentConn();
+    if (c->memory) return mem::collectionInfo(c->db, m_->collection);
     return guard([&]() -> Value {
         auto entry = c->pool->acquire();
         Value cmd{{"listCollections", 1}, {"filter", Value{{"name", m_->collection}}}};
@@ -2853,6 +3154,10 @@ void Model::syncValidator(const std::string &level, const std::string &action) c
     cmd["validator"] = Value{{"$jsonSchema", m_->schema.toJsonSchema()}};
     cmd["validationLevel"] = level;
     cmd["validationAction"] = action;
+    if (c->memory) {
+        mem::setValidator(c->db, m_->collection, cmd["validator"], level);
+        return;
+    }
     guard([&] {
         auto entry = c->pool->acquire();
         OpTrace nv_trace(m_->collection, "collMod", cmd);
@@ -3105,6 +3410,12 @@ struct BatchWriterImpl {
         mongocxx::options::insert opts;
         opts.ordered(o.ordered);
         try {
+            if (auto mc = memDb(*m)) {
+                auto r = mem::insertMany(mc->db, m->collection, batch, o.ordered);
+                written = r.inserted;
+                error = r.error;
+                return;
+            }
             Op op = open(*m);
             OpTrace nv_trace(m->collection, "insertMany (batch)", Value{{"count", static_cast<int64_t>(raw.size())}});
             auto r = NV(op, insert_many, raw, opts);
@@ -3187,6 +3498,190 @@ Model model(const std::string &name, const Schema &schema, const std::string &co
     std::lock_guard<std::mutex> lk(gModelsMu);
     gModels[name] = impl;
     return Model(impl);
+}
+
+/* ======================= cache API ======================= */
+void Model::cache(CacheOptions options) const {
+    if (options.ttlMs <= 0 || options.maxEntries == 0) throw Error("nevla: cache(): ttlMs and maxEntries must be > 0");
+    std::lock_guard<std::mutex> lk(m_->cache->mu);
+    m_->cache->o = options;
+    m_->cache->on = true;
+}
+void Model::disableCache() const {
+    m_->cache->clear();
+    std::lock_guard<std::mutex> lk(m_->cache->mu);
+    m_->cache->on = false;
+}
+void Model::clearCache() const { m_->cache->clear(); }
+CacheStats Model::cacheStats() const {
+    std::lock_guard<std::mutex> lk(m_->cache->mu);
+    return CacheStats{m_->cache->hits, m_->cache->misses, static_cast<int64_t>(m_->cache->map.size())};
+}
+
+void dropDatabase() {
+    auto c = currentConn();
+    if (c->memory) {
+        mem::dropDatabase(c->db);
+    } else {
+        guard([&] {
+            auto entry = c->pool->acquire();
+            (*entry)[c->db].drop();
+        });
+    }
+    std::lock_guard<std::mutex> lk(gModelsMu);
+    for (auto &kv : gModels) {
+        kv.second->indexGen = 0;
+        cacheInvalidate(*kv.second);
+    }
+}
+
+/* ======================= migrations ======================= */
+namespace {
+struct MigrationDef {
+    std::string id;
+    std::function<void()> up, down;
+};
+std::mutex gMigMu;
+std::vector<MigrationDef> gMigrations;
+
+Model migrationStore(const std::string &collection) {
+    static std::mutex mu;
+    std::lock_guard<std::mutex> lk(mu);
+    std::string name = "__nevla_migrations:" + collection;
+    try {
+        return model(name);
+    } catch (const Error &) {
+        return model(name, Schema({{"_id", String()}}, {.strict = false, .versionKey = ""}), collection);
+    }
+}
+
+std::vector<MigrationDef> registered() {
+    std::lock_guard<std::mutex> lk(gMigMu);
+    auto out = gMigrations;
+    std::sort(out.begin(), out.end(), [](const MigrationDef &a, const MigrationDef &b) { return a.id < b.id; });
+    return out;
+}
+
+// Only one process runs migrations at a time: a lock document with an owner and an expiry
+class MigrationLock {
+  public:
+    MigrationLock(Model store, int64_t timeoutMs) : store_(std::move(store)) {
+        std::random_device rd;
+        owner_ = std::to_string(rd()) + "-" + std::to_string(Date::now().ms);
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+        for (;;) {
+            Date now = Date::now();
+            Value filter{{"_id", "__lock"},
+                         {"$or", Value::array({Value{{"until", Value{{"$lt", now}}}}, Value{{"owner", owner_}}})}};
+            Value set{{"$set", Value{{"owner", owner_}, {"until", Date{now.ms + 10 * 60 * 1000}}}}};
+            try {
+                store_.updateOne(filter, set, {.upsert = true});
+                return;                            // got it
+            } catch (const DuplicateKeyError &) {  // somebody else holds a valid lock
+            }
+            if (std::chrono::steady_clock::now() > deadline)
+                throw Error("nevla: migrate(): another process is running migrations (lock not released)");
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+    }
+    ~MigrationLock() {
+        try {
+            store_.deleteOne({{"_id", "__lock"}, {"owner", owner_}});
+        } catch (...) {
+        }
+    }
+
+  private:
+    Model store_;
+    std::string owner_;
+};
+
+std::set<std::string> appliedIds(const Model &store) {
+    std::set<std::string> out;
+    for (const auto &v : store.find({{"_id", {{"$ne", "__lock"}}}}).select("_id").lean()) out.insert(v["_id"].str());
+    return out;
+}
+
+void runStep(const std::function<void()> &fn, bool tx) {
+    if (tx)
+        transaction(fn);
+    else
+        fn();
+}
+}  // namespace
+
+void migration(const std::string &id, std::function<void()> up, std::function<void()> down) {
+    if (id.empty() || id == "__lock") throw Error("nevla: migration(): bad id \"" + id + "\"");
+    if (!up) throw Error("nevla: migration(\"" + id + "\"): the up function is missing");
+    std::lock_guard<std::mutex> lk(gMigMu);
+    for (const auto &m : gMigrations)
+        if (m.id == id) throw Error("nevla: migration(\"" + id + "\") is registered twice");
+    gMigrations.push_back({id, std::move(up), std::move(down)});
+}
+
+void clearMigrations() {
+    std::lock_guard<std::mutex> lk(gMigMu);
+    gMigrations.clear();
+}
+
+std::vector<std::string> migrate(const MigrateOptions &o) {
+    Model store = migrationStore(o.collection);
+    MigrationLock lock(store, o.lockTimeoutMs);
+    auto done = appliedIds(store);
+    std::vector<std::string> ran;
+    for (const auto &m : registered()) {
+        if (done.count(m.id)) continue;
+        auto t0 = std::chrono::steady_clock::now();
+        try {
+            runStep(m.up, o.transaction);
+        } catch (const std::exception &e) {
+            throw Error("nevla: migration \"" + m.id + "\" failed: " + e.what() +
+                        (ran.empty() ? "" : " (migrations before it were applied)"));
+        }
+        int64_t ms =
+            std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+        store.create({{"_id", m.id}, {"at", Date::now()}, {"ms", ms}});
+        ran.push_back(m.id);
+    }
+    return ran;
+}
+
+std::vector<std::string> rollback(int steps, const MigrateOptions &o) {
+    if (steps < 1) return {};
+    Model store = migrationStore(o.collection);
+    MigrationLock lock(store, o.lockTimeoutMs);
+    auto done = appliedIds(store);
+    auto all = registered();
+    std::vector<std::string> undone;
+    for (auto it = all.rbegin(); it != all.rend() && static_cast<int>(undone.size()) < steps; ++it) {
+        if (!done.count(it->id)) continue;
+        if (!it->down) throw Error("nevla: rollback(): migration \"" + it->id + "\" has no down function");
+        try {
+            runStep(it->down, o.transaction);
+        } catch (const std::exception &e) {
+            throw Error("nevla: rollback of migration \"" + it->id + "\" failed: " + e.what());
+        }
+        store.deleteOne({{"_id", it->id}});
+        undone.push_back(it->id);
+    }
+    return undone;
+}
+
+std::vector<MigrationState> migrationStatus(const MigrateOptions &o) {
+    Model store = migrationStore(o.collection);
+    std::map<std::string, Value> rows;
+    for (auto &v : store.find({{"_id", {{"$ne", "__lock"}}}}).lean()) rows[v["_id"].str()] = v;
+    std::vector<MigrationState> out;
+    for (const auto &m : registered()) {
+        MigrationState st{m.id, false, Value(), 0};
+        if (auto it = rows.find(m.id); it != rows.end()) {
+            st.applied = true;
+            st.at = it->second["at"];
+            st.ms = it->second["ms"].asInt();
+        }
+        out.push_back(std::move(st));
+    }
+    return out;
 }
 
 Model model(const std::string &name) { return Model(lookup(name)); }

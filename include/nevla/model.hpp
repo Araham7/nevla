@@ -62,6 +62,44 @@ void setSlowQueryThreshold(int64_t ms, std::function<void(const SlowQuery &)> fn
 // strictQuery for every model: a filter path that is not in the schema throws (Mongoose silently ignores it)
 void setStrictQuery(bool on);
 
+// Drop the whole current database (tests / resets). Careful: everything is gone.
+void dropDatabase();
+
+/* ---------------- Migrations ----------------
+   nevla::migration("2026-11-20-add-plan",
+                    [] { User.updateMany(Value::object(), {{"plan", "free"}}); },        // up
+                    [] { User.updateMany(Value::object(), {{"$unset", {{"plan", ""}}}}); });  // down (optional)
+   nevla::migrate();      // runs the ones not run yet, in id order; a lock stops two servers running them at once
+   nevla::rollback();     // undoes the last one
+   Ids are sorted as text: start them with a date ("2026-11-20-...") so the order is clear.                */
+struct MigrateOptions {
+    bool transaction = false;                     // run each migration in a transaction (replica set)
+    int64_t lockTimeoutMs = 60000;                // wait this long for another process's migrate()
+    std::string collection = "nevla_migrations";  // where applied migrations are recorded
+};
+struct MigrationState {
+    std::string id;
+    bool applied = false;
+    Value at;  // Date when applied
+    int64_t ms = 0;
+};
+void migration(const std::string &id, std::function<void()> up, std::function<void()> down = nullptr);
+std::vector<std::string> migrate(const MigrateOptions &options = {});  // ids that ran now
+std::vector<std::string> rollback(int steps = 1, const MigrateOptions &options = {});
+std::vector<MigrationState> migrationStatus(const MigrateOptions &options = {});
+void clearMigrations();  // forget registered migrations (the records in the database stay)
+
+/* ---------------- findById cache ----------------
+   User.cache({.ttlMs = 30000});   findById() is served from memory; writes through nevla clear it.
+   Not used inside transactions or when the model has findOne middleware (e.g. multiTenant / softDelete). */
+struct CacheOptions {
+    int64_t ttlMs = 60000;      // entries older than this are read again (other servers may have changed them)
+    size_t maxEntries = 10000;  // least recently used entries are dropped first
+};
+struct CacheStats {
+    int64_t hits = 0, misses = 0, size = 0;
+};
+
 /* ---------------- Results / options ---------------- */
 struct UpdateOptions {
     bool upsert = false;
@@ -644,6 +682,11 @@ class Model {
     void syncValidator(const std::string &level = "strict", const std::string &action = "error") const;
 
     BatchWriter batchWriter(BatchOptions options = {}) const;
+
+    void cache(CacheOptions options = {}) const;  // turn the findById cache on
+    void disableCache() const;
+    void clearCache() const;
+    CacheStats cacheStats() const;
     Page fromQuery(const std::map<std::string, std::string> &params, const QueryParamOptions &options) const;
     void syncIndexes() const;  // createIndexes() + drop indexes that are no longer in the schema
     std::vector<Value> listIndexes() const;

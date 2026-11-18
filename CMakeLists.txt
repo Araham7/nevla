@@ -23,7 +23,7 @@ else()
   set(NEVLA_MONGOCXX mongo::mongocxx_static)
 endif()
 
-add_library(nevla src/value.cc src/schema.cc src/model.cc src/formula.cc src/async.cc src/plugins.cc src/crypto.cc)
+add_library(nevla src/value.cc src/schema.cc src/model.cc src/formula.cc src/async.cc src/plugins.cc src/crypto.cc src/memory.cc)
 add_library(nevla::nevla ALIAS nevla)
 target_include_directories(nevla PUBLIC
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -38,6 +38,9 @@ if(NEVLA_BUILD_TESTS)
   add_executable(nevla_tests tests/test.cc)
   target_link_libraries(nevla_tests PRIVATE nevla)
   add_test(NAME nevla_tests COMMAND nevla_tests)
+  # the same suite on the built-in in-memory database (no MongoDB server needed)
+  add_test(NAME nevla_tests_memory COMMAND nevla_tests)
+  set_tests_properties(nevla_tests_memory PROPERTIES ENVIRONMENT "NEVLA_TEST_URI=memory://nevla_test")
   # Typed models: these files must be rejected by the compiler (typos / wrong types are compile errors)
   foreach(cf typo_member wrong_value_type inc_on_string ok_control)
     add_test(NAME compile_${cf}

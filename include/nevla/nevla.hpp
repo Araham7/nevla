@@ -5,4 +5,5 @@
 #include "model.hpp"
 #include "schema.hpp"
 #include "typed.hpp"
+#include "typed_model.hpp"
 #include "value.hpp"

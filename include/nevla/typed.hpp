@@ -40,9 +40,20 @@ inline bool skipEmptyId(const std::string &key, const Value &v) {
 #define NEVLA_FROM_MEMBER(f) \
     if (const ::nevla::Value *nv_p = nv_in.find(::nevla::detail::structKey(#f))) from_value(*nv_p, nv_out.f);
 
-#define NEVLA_STRUCT(Type, ...)                                       \
-    inline void to_value(::nevla::Value &nv_out, const Type &nv_in) { \
-        nv_out = ::nevla::Value::object();                            \
-        NEVLA_FOR_EACH(NEVLA_TO_MEMBER, __VA_ARGS__)                  \
-    }                                                                 \
-    inline void from_value(const ::nevla::Value &nv_in, Type &nv_out) { NEVLA_FOR_EACH(NEVLA_FROM_MEMBER, __VA_ARGS__) }
+#define NEVLA_VISIT_MEMBER(f) nv_fn(#f, &NvSelf::f);
+
+/* Also generates nevla_visit(const Type *, fn): calls fn("member", &Type::member) for every member.
+   TypedModel / schemaOf / member-pointer queries are built on it. */
+#define NEVLA_STRUCT(Type, ...)                                         \
+    inline void to_value(::nevla::Value &nv_out, const Type &nv_in) {   \
+        nv_out = ::nevla::Value::object();                              \
+        NEVLA_FOR_EACH(NEVLA_TO_MEMBER, __VA_ARGS__)                    \
+    }                                                                   \
+    inline void from_value(const ::nevla::Value &nv_in, Type &nv_out) { \
+        NEVLA_FOR_EACH(NEVLA_FROM_MEMBER, __VA_ARGS__)                  \
+    }                                                                   \
+    template <class NvFn>                                               \
+    inline void nevla_visit(const Type *, NvFn &&nv_fn) {               \
+        using NvSelf = Type;                                            \
+        NEVLA_FOR_EACH(NEVLA_VISIT_MEMBER, __VA_ARGS__)                 \
+    }
